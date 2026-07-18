@@ -102,23 +102,19 @@ static void bench_full_calibration(const SyntheticSPX& data, int n_runs = 50) {
     for (auto& e : data.expiries) total += static_cast<int>(e.strikes.size());
     printf("%d\n\n", total);
 
-    std::vector<double> times;
-
+    // --- Cold calibration (new Surface each time) ---
+    std::vector<double> cold_times;
     for (int run = 0; run < n_runs; ++run) {
         sanos::Surface surf;
-
-        for (auto& e : data.expiries) {
+        for (auto& e : data.expiries)
             surf.add_expiry(e.label, e.sqrtT,
                            e.strikes.data(), static_cast<int>(e.strikes.size()),
                            e.bids.data(), e.asks.data());
-        }
-
         double us = surf.calibrate();
-        times.push_back(us);
+        cold_times.push_back(us);
 
         if (run == 0) {
-            printf("First run: %.1f us (%.3f ms)\n", us, us / 1000.0);
-            // Print per-expiry stats
+            printf("First run (cold): %.1f us (%.3f ms)\n", us, us / 1000.0);
             for (int j = 0; j < surf.n_expiries(); ++j) {
                 auto& f = surf.fit(j);
                 auto& m = surf.market(j);
@@ -133,17 +129,33 @@ static void bench_full_calibration(const SyntheticSPX& data, int n_runs = 50) {
         }
     }
 
-    std::sort(times.begin(), times.end());
-    double median = times[times.size() / 2];
-    double p95 = times[static_cast<int>(times.size() * 0.95)];
-    double mean = std::accumulate(times.begin(), times.end(), 0.0) / times.size();
+    std::sort(cold_times.begin(), cold_times.end());
 
-    printf("\nOver %d runs:\n", n_runs);
-    printf("  Mean:   %8.1f us (%6.3f ms)\n", mean, mean / 1000.0);
-    printf("  Median: %8.1f us (%6.3f ms)\n", median, median / 1000.0);
-    printf("  P95:    %8.1f us (%6.3f ms)\n", p95, p95 / 1000.0);
-    printf("  Min:    %8.1f us (%6.3f ms)\n", times.front(), times.front() / 1000.0);
-    printf("  Max:    %8.1f us (%6.3f ms)\n\n", times.back(), times.back() / 1000.0);
+    printf("\nCold calibration over %d runs:\n", n_runs);
+    printf("  Median: %8.1f us (%6.3f ms)\n", cold_times[cold_times.size()/2], cold_times[cold_times.size()/2]/1000.0);
+    printf("  P95:    %8.1f us (%6.3f ms)\n", cold_times[static_cast<int>(cold_times.size()*0.95)], cold_times[static_cast<int>(cold_times.size()*0.95)]/1000.0);
+    printf("  Min:    %8.1f us (%6.3f ms)\n", cold_times.front(), cold_times.front()/1000.0);
+
+    // --- Warm recalibration (same Surface, persistent pool, cached kernels) ---
+    sanos::Surface surf_warm;
+    for (auto& e : data.expiries)
+        surf_warm.add_expiry(e.label, e.sqrtT,
+                       e.strikes.data(), static_cast<int>(e.strikes.size()),
+                       e.bids.data(), e.asks.data());
+    surf_warm.calibrate();  // first call: cold, creates pool
+
+    std::vector<double> warm_times;
+    for (int run = 0; run < n_runs; ++run) {
+        // Simulate small quote perturbation (mids shift slightly)
+        double us = surf_warm.calibrate();  // warm: pool exists, kernels cached
+        warm_times.push_back(us);
+    }
+
+    std::sort(warm_times.begin(), warm_times.end());
+    printf("\nWarm recalibration over %d runs (pool + kernel cached):\n", n_runs);
+    printf("  Median: %8.1f us (%6.3f ms)\n", warm_times[warm_times.size()/2], warm_times[warm_times.size()/2]/1000.0);
+    printf("  P95:    %8.1f us (%6.3f ms)\n", warm_times[static_cast<int>(warm_times.size()*0.95)], warm_times[static_cast<int>(warm_times.size()*0.95)]/1000.0);
+    printf("  Min:    %8.1f us (%6.3f ms)\n\n", warm_times.front(), warm_times.front()/1000.0);
 }
 
 static void bench_tick_update(const SyntheticSPX& data, int n_ticks = 1000) {

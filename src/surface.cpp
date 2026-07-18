@@ -10,8 +10,6 @@
 #include <cstring>
 #include <chrono>
 #include <cassert>
-#include <future>
-#include <thread>
 
 namespace sanos {
 
@@ -64,6 +62,14 @@ void build_model_strikes(
 // --- Surface implementation ---
 
 Surface::Surface(SurfaceConfig cfg) : cfg_(cfg) {}
+
+void Surface::ensure_pool() {
+    if (!pool_) {
+        int nt = cfg_.n_threads;
+        if (nt <= 0) nt = std::max(1, static_cast<int>(std::thread::hardware_concurrency()));
+        if (nt > 1) pool_ = std::make_unique<ThreadPool>(nt);
+    }
+}
 
 void Surface::clear() {
     markets_.clear();
@@ -358,20 +364,10 @@ double Surface::calibrate() {
     auto t0 = std::chrono::high_resolution_clock::now();
     int M = n_expiries();
 
-    int n_threads = cfg_.n_threads;
-    if (n_threads <= 0)
-        n_threads = std::max(1, static_cast<int>(std::thread::hardware_concurrency()));
+    ensure_pool();
 
-    if (n_threads > 1 && M > 1) {
-        // Parallel: each expiry is independent
-        std::vector<std::future<void>> futures;
-        futures.reserve(M);
-        for (int j = 0; j < M; ++j) {
-            futures.push_back(std::async(std::launch::async, [this, j]() {
-                calibrate_expiry(j);
-            }));
-        }
-        for (auto& fut : futures) fut.get();
+    if (pool_ && M > 1) {
+        pool_->parallel_for(M, [this](int j) { calibrate_expiry(j); });
     } else {
         for (int j = 0; j < M; ++j) calibrate_expiry(j);
     }
