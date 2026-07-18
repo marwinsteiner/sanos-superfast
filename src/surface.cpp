@@ -325,20 +325,13 @@ double Surface::calibrate() {
 
     int M = n_expiries();
 
-    // Step 1: Compute IVs for all expiries
     for (int j = 0; j < M; ++j) compute_iv(j);
-
-    // Step 2: Setup model grids
     for (int j = 0; j < M; ++j) setup_expiry(j);
-
-    // Step 3: Build kernels and solve (iterative: front to back)
     for (int j = 0; j < M; ++j) {
         build_kernel(j);
         build_qp(j);
         solve_expiry(j);
     }
-
-    // Step 4: Time interpolation data
     update_time_interp();
 
     auto t1 = std::chrono::high_resolution_clock::now();

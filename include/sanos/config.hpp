@@ -10,7 +10,7 @@ struct SurfaceConfig {
     double floor_vol = 0.01;
 
     // Model strike grid parameters
-    double max_dx = 0.05;     // max gap between model strikes
+    double max_dx = 0.10;     // max gap between model strikes (wider = faster, fewer model points)
     double min_dx = 1e-6;     // min gap (drop closer strikes)
     double min_k  = 0.1;      // left boundary strike (pure)
     double max_k  = 3.0;      // right boundary strike (pure)
