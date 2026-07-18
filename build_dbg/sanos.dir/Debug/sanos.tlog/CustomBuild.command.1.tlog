@@ -1,0 +1,10 @@
+^C:\USERS\MARWI\CPPPROJECTS\SANOS-SUPERFAST\CMAKELISTS.TXT
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SC:/Users/marwi/CppProjects/sanos-superfast -BC:/Users/marwi/CppProjects/sanos-superfast/build_dbg --check-stamp-file C:/Users/marwi/CppProjects/sanos-superfast/build_dbg/CMakeFiles/generate.stamp
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd

@@ -1,0 +1,5 @@
+C:/Users/marwi/CppProjects/sanos-superfast/build_dbg/CMakeFiles/sanos.dir
+C:/Users/marwi/CppProjects/sanos-superfast/build_dbg/CMakeFiles/bench_surface.dir
+C:/Users/marwi/CppProjects/sanos-superfast/build_dbg/CMakeFiles/test_sanos.dir
+C:/Users/marwi/CppProjects/sanos-superfast/build_dbg/CMakeFiles/ALL_BUILD.dir
+C:/Users/marwi/CppProjects/sanos-superfast/build_dbg/CMakeFiles/ZERO_CHECK.dir

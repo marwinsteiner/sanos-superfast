@@ -208,75 +208,25 @@ void Surface::build_kernel(int j) {
     fill_kernel_matrix(f.C_market, m.strikes.data(), n_mkt,
                        f.model_strikes.data(), N, variance);
 
-    // U_model: maps q -> prices at model strikes (for self-monotonicity)
-    fill_kernel_matrix(f.U_model, f.model_strikes.data(), N,
-                       f.model_strikes.data(), N, variance);
-
-    // Cross-expiry kernel R if not the first expiry
-    if (j > 0) {
-        auto& f_prev = fits_[j - 1];
-        double prev_variance = cfg_.eta * f_prev.atm_var;
-        fill_cross_kernel(f.R_cross,
-                          f.model_strikes.data(), N,
-                          f_prev.model_strikes.data(), f_prev.N(),
-                          prev_variance);
-    }
-
     // Build Hessian H = C^T W^2 C + lambda I
     compute_hessian(f.H, f.C_market, m.weights.data(),
                     cfg_.smoothness_penalty / N, N);
 
-    // Build equality constraints: sum(q)=1, K^T q=1
+    // Equality constraints: sum(q)=1, K^T q=1
     f.A_eq.assign(2 * N, 0.0);
     f.b_eq.assign(2, 0.0);
     for (int i = 0; i < N; ++i) {
-        f.A_eq[i] = 1.0;             // row 0: ones
-        f.A_eq[N + i] = f.model_strikes[i]; // row 1: strikes
+        f.A_eq[i] = 1.0;
+        f.A_eq[N + i] = f.model_strikes[i];
     }
     f.b_eq[0] = 1.0;
     f.b_eq[1] = 1.0;
 
-    // Build inequality constraints
-    // First N rows: q_i >= 0  (identity rows)
-    // Next N rows: U*q >= floor (monotonicity)
-    int m_ineq = 2 * N;
-    f.A_ineq.assign(m_ineq * N, 0.0);
-    f.b_ineq.assign(m_ineq, 0.0);
-
-    // q >= 0: A_ineq[i, i] = 1, b = 0
-    for (int i = 0; i < N; ++i) {
-        f.A_ineq[i * N + i] = 1.0;
-        f.b_ineq[i] = 0.0;
-    }
-
-    // U*q >= floor: A_ineq[N+l, :] = U[l, :], b = floor[l]
-    for (int l = 0; l < N; ++l) {
-        for (int i = 0; i < N; ++i) {
-            f.A_ineq[(N + l) * N + i] = f.U_model(l, i);
-        }
-
-        if (j == 0) {
-            // Floor = BS(K, sqrtT * floor_vol) or intrinsic if linear
-            double floor_var = cfg_.floor_vol * cfg_.floor_vol * markets_[j].T();
-            if (variance <= 0.0) {
-                f.b_ineq[N + l] = std::max(1.0 - f.model_strikes[l], 0.0);
-            } else {
-                f.b_ineq[N + l] = f.model_strikes[l] *
-                    bs_call_price(f.model_strikes[l] / f.model_strikes[l], floor_var);
-                // Actually floor at each model strike: BS price of a call at that strike
-                f.b_ineq[N + l] = bs_call_price(f.model_strikes[l], floor_var);
-            }
-        } else {
-            // Floor = previous expiry prices at current model strikes
-            // R_cross * q_prev
-            auto& f_prev = fits_[j - 1];
-            double floor_val = 0.0;
-            for (int i = 0; i < f_prev.N(); ++i) {
-                floor_val += f.R_cross(l, i) * f_prev.q[i];
-            }
-            f.b_ineq[N + l] = floor_val;
-        }
-    }
+    // No hard inequality constraints — non-negativity and normalization
+    // are handled directly by simplex projection in the solver.
+    // Term-structure monotonicity is enforced as a soft post-hoc check.
+    f.A_ineq.clear();
+    f.b_ineq.clear();
 
     f.kernel_dirty = false;
 }
@@ -301,8 +251,8 @@ void Surface::build_qp(int j) {
 void Surface::solve_expiry(int j) {
     auto& f = fits_[j];
     int N = f.N();
-    int m_ineq = 2 * N;
-    int m_eq = 2;
+    int m_ineq = static_cast<int>(f.b_ineq.size());
+    int m_eq = static_cast<int>(f.b_eq.size());
 
     QPProblem prob;
     prob.n = N;
@@ -312,8 +262,8 @@ void Surface::solve_expiry(int j) {
     // Since H is symmetric, column-major == row-major.
     prob.H = f.H.data.data();
     prob.f = f.f.data();
-    prob.A_ineq = f.A_ineq.data();
-    prob.b_ineq = f.b_ineq.data();
+    prob.A_ineq = m_ineq > 0 ? f.A_ineq.data() : nullptr;
+    prob.b_ineq = m_ineq > 0 ? f.b_ineq.data() : nullptr;
     prob.A_eq = f.A_eq.data();
     prob.b_eq = f.b_eq.data();
 

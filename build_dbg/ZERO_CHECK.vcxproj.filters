@@ -1,0 +1,13 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <CustomBuild Include="C:\Users\marwi\CppProjects\sanos-superfast\build_dbg\CMakeFiles\8b3b4abda501fcbf4e6aee8693c3ce6c\generate.stamp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="CMake Rules">
+      <UniqueIdentifier>{F185914C-6732-3D04-82BE-B1F7902F5014}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>

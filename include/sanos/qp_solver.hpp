@@ -3,22 +3,22 @@
 
 namespace sanos {
 
-// Warm-started active-set QP solver (Goldfarb-Idnani style).
+// ADMM-based QP solver for SANOS density estimation.
 //
 // Solves:  min  0.5 * x^T H x + f^T x
 //          s.t. A_ineq * x >= b_ineq    (m_ineq inequality constraints)
 //               A_eq   * x  = b_eq      (m_eq   equality constraints)
 //
-// H must be symmetric positive definite (n x n).
-// A_ineq is m_ineq x n, A_eq is m_eq x n.
+// Uses ADMM splitting: min g(q) + I_C(z) s.t. q = z
+// where g(q) = 0.5 q^T H q + f^T q and C is the constraint set.
 //
-// Warm start: provide a feasible x0 and the previous active set.
-// If x0 is nullptr, starts from unconstrained optimum projected to feasibility.
+// q-update: q = (H + rho*I)^{-1} (rho*(z - u) - f)   [cached Cholesky]
+// z-update: z = project_C(q + u)
+// u-update: u += q - z
 
 enum class QPStatus {
     Optimal,
     MaxIters,
-    Infeasible,
     NumericalError
 };
 
@@ -29,13 +29,11 @@ struct QPResult {
 };
 
 struct QPProblem {
-    // Dimensions
-    int n       = 0;  // variables
-    int m_ineq  = 0;  // inequality constraints
-    int m_eq    = 0;  // equality constraints
+    int n       = 0;
+    int m_ineq  = 0;
+    int m_eq    = 0;
 
-    // Problem data (all point to externally owned memory)
-    const double* H      = nullptr;  // n x n symmetric PD (row-major)
+    const double* H      = nullptr;  // n x n (row-major, symmetric)
     const double* f      = nullptr;  // n
     const double* A_ineq = nullptr;  // m_ineq x n (row-major)
     const double* b_ineq = nullptr;  // m_ineq
@@ -43,29 +41,30 @@ struct QPProblem {
     const double* b_eq   = nullptr;  // m_eq
 };
 
-// Solver workspace — pre-allocate once, reuse across solves.
 struct QPWorkspace {
-    AVec<double> L;          // Cholesky factor of working Hessian (n x n)
-    AVec<double> x;          // current solution
-    AVec<double> grad;       // gradient at x
-    AVec<double> dx;         // step direction
-    AVec<double> tmp;        // scratch
-    AVec<double> tmp2;       // scratch
-    AVec<double> lambda;     // dual variables for active constraints
-    AVec<int>    active_set; // indices of active inequality constraints
-    int          n_active = 0;
-    int          n = 0;
+    // Cholesky of (H + rho*I)
+    AVec<double> L;
+    bool factored = false;
+    double cached_rho = -1.0;
 
-    void resize(int n, int m_total);
+    // ADMM state (warm-started across solves)
+    AVec<double> z;     // consensus variable
+    AVec<double> u;     // scaled dual variable
+    AVec<double> q;     // primal
+    AVec<double> rhs;   // scratch for linear solve
+    AVec<double> tmp;   // scratch
+    AVec<double> tmp2;  // scratch
+    int n = 0;
+    bool warm = false;
+
+    void resize(int n_, int m_total);
 };
 
-// Solve the QP. x_out must have space for n doubles.
-// If warm_x is not null, it's used as starting point (must be feasible).
 QPResult qp_solve(
     double* x_out,
     const QPProblem& prob,
     QPWorkspace& ws,
-    double tol = 1e-10,
+    double tol = 1e-8,
     int max_iters = 200,
     const double* warm_x = nullptr);
 
