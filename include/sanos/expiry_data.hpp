@@ -66,9 +66,10 @@ struct ExpiryFit {
     // QP solver workspace (reused)
     QPWorkspace qp_ws;
 
-    // Flags
-    bool kernel_dirty = true;  // need to recompute kernel matrices
-    bool fit_dirty    = true;  // need to re-solve QP
+    // Caching
+    double cached_atm_var = -1.0;  // ATM var when kernel was last built
+    bool kernel_dirty = true;      // need to recompute kernel matrices
+    bool fit_dirty    = true;      // need to re-solve QP
 };
 
 // Generate model strikes from market strikes, adding fill strikes where gaps > max_dx

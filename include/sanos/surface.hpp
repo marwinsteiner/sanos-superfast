@@ -75,6 +75,7 @@ private:
     void build_kernel(int j);
     void build_qp(int j);
     void solve_expiry(int j);
+    void calibrate_expiry(int j);
     void compute_iv(int j);
     void update_time_interp();
 

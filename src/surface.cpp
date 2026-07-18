@@ -10,10 +10,12 @@
 #include <cstring>
 #include <chrono>
 #include <cassert>
+#include <future>
+#include <thread>
 
 namespace sanos {
 
-// --- Model strike grid generation ---
+// --- Model strike grid generation (wing-aware) ---
 
 void build_model_strikes(
     AVec<double>& model_strikes,
@@ -25,51 +27,38 @@ void build_model_strikes(
     model_strikes.clear();
     market_ix.assign(n, -1);
 
-    double outer_max_dx = std::min(0.25, max_dx * 10.0);
+    double outer_max_dx = std::min(0.5, max_dx * 10.0);
 
-    // Left boundary region
-    double left = strikes[0] - max_dx;
-    if (left > min_k) {
-        int n_left = std::max(2, 1 + static_cast<int>(std::floor((left - min_k) / outer_max_dx)));
-        for (int i = 0; i < n_left; ++i) {
-            model_strikes.push_back(min_k + (left - min_k) * i / (n_left - 1));
-        }
-    } else {
-        model_strikes.push_back(min_k);
-    }
+    // Left boundary: single point
+    model_strikes.push_back(min_k);
 
     // First market strike
     market_ix[0] = static_cast<int>(model_strikes.size());
     model_strikes.push_back(strikes[0]);
 
-    // Interior market strikes with fill
+    // Interior market strikes with adaptive fill
     for (int r = 1; r < n; ++r) {
         double dx = strikes[r] - model_strikes.back();
-        if (dx <= min_dx) {
-            market_ix[r] = -1;  // dropped
-            continue;
-        }
-        if (dx > max_dx) {
-            int n_fill = std::max(1, static_cast<int>(dx / max_dx)) + 1;
+        if (dx <= min_dx) { market_ix[r] = -1; continue; }
+
+        // Adaptive: use wider spacing in wings
+        double local_dx = max_dx;
+        double dist_from_atm = std::min(std::abs(strikes[r] - 1.0),
+                                         std::abs(model_strikes.back() - 1.0));
+        if (dist_from_atm > 0.15) local_dx = std::max(max_dx, 0.5);
+
+        if (dx > local_dx) {
+            int n_fill = std::max(1, static_cast<int>(dx / local_dx)) + 1;
             double prev = model_strikes.back();
-            for (int f = 1; f < n_fill; ++f) {
+            for (int f = 1; f < n_fill; ++f)
                 model_strikes.push_back(prev + dx * f / n_fill);
-            }
         }
         market_ix[r] = static_cast<int>(model_strikes.size());
         model_strikes.push_back(strikes[r]);
     }
 
-    // Right boundary region
-    double right = strikes[n - 1] + max_dx;
-    if (right < max_k) {
-        int n_right = std::max(2, 1 + static_cast<int>(std::floor((max_k - right) / outer_max_dx)));
-        for (int i = 1; i < n_right; ++i) {
-            model_strikes.push_back(right + (max_k - right) * i / (n_right - 1));
-        }
-    } else {
-        model_strikes.push_back(max_k);
-    }
+    // Right boundary: single point
+    model_strikes.push_back(max_k);
 }
 
 // --- Surface implementation ---
@@ -111,12 +100,10 @@ void Surface::add_expiry(
         m.weights[i] = std::min(inv_spread, cfg_.max_inv_spread);
     }
 
-    // Normalize weights
     double wsum = 0.0;
     for (int i = 0; i < n; ++i) wsum += m.weights[i];
-    if (wsum > 0.0) {
+    if (wsum > 0.0)
         for (int i = 0; i < n; ++i) m.weights[i] /= wsum;
-    }
 
     markets_.push_back(std::move(m));
     fits_.emplace_back();
@@ -132,9 +119,25 @@ void Surface::set_market(
     const double* const* asks)
 {
     clear();
-    for (int j = 0; j < n_expiries; ++j) {
+    for (int j = 0; j < n_expiries; ++j)
         add_expiry(labels[j], sqrtTs[j], strikes[j], n_strikes[j], bids[j], asks[j]);
+}
+
+// Fast ATM vol: only compute IV for the two strikes bracketing K=1
+static double fast_atm_vol(const ExpiryMarket& m) {
+    for (int i = 0; i < m.n() - 1; ++i) {
+        if (m.strikes[i] <= 1.0 && m.strikes[i + 1] > 1.0) {
+            double t = (1.0 - m.strikes[i]) / (m.strikes[i + 1] - m.strikes[i]);
+            double mid_lo = m.mids[i], mid_hi = m.mids[i + 1];
+            double mid_atm = mid_lo * (1.0 - t) + mid_hi * t;
+
+            // Single IV call for ATM mid price
+            iv::Status st;
+            double vol = iv::implied_volatility(1.0, 1.0, mid_atm, m.T(), true, &st);
+            return st.ok ? vol : 0.15;  // fallback
+        }
     }
+    return 0.15;
 }
 
 void Surface::compute_iv(int j) {
@@ -151,7 +154,6 @@ void Surface::compute_iv(int j) {
         double ask_vol = iv::implied_volatility(1.0, K, m.asks[i], m.T(), true, &st);
         m.iv_asks[i] = st.ok ? ask_vol : 0.0;
 
-        // Store total variance for warm restart
         m.w_prev[i] = (m.iv_bids[i] + m.iv_asks[i]) * 0.5;
         m.w_prev[i] = m.w_prev[i] * m.w_prev[i] * m.T();
     }
@@ -161,7 +163,6 @@ void Surface::setup_expiry(int j) {
     auto& m = markets_[j];
     auto& f = fits_[j];
 
-    // Build model strike grid
     build_model_strikes(
         f.model_strikes, f.market_ix,
         m.strikes.data(), m.n(),
@@ -170,27 +171,16 @@ void Surface::setup_expiry(int j) {
 
     int N = f.N();
 
-    // Compute ATM variance from market
-    // Linear interpolation of bid IV at K=1
-    double atm_iv = 0.0;
-    for (int i = 0; i < m.n() - 1; ++i) {
-        if (m.strikes[i] <= 1.0 && m.strikes[i + 1] > 1.0) {
-            double t = (1.0 - m.strikes[i]) / (m.strikes[i + 1] - m.strikes[i]);
-            atm_iv = m.iv_bids[i] * (1.0 - t) + m.iv_bids[i + 1] * t;
-            break;
-        }
-    }
-    f.atm_vol = atm_iv;
-    f.atm_var = atm_iv * atm_iv * m.T();
+    // Fast ATM vol (single IV call, not full strip)
+    f.atm_vol = fast_atm_vol(m);
+    f.atm_var = f.atm_vol * f.atm_vol * m.T();
 
-    // Set model vols (ATM mode): vol_fac * sqrt(atm_var) / sqrtT = vol_fac * atm_iv
-    double model_vol = cfg_.vol_fac * atm_iv;
+    double model_vol = cfg_.vol_fac * f.atm_vol;
     f.model_vols.assign(N, model_vol);
 
-    // Allocate solution
-    f.q.assign(N, 0.0);
-    f.fitted.assign(m.n(), 0.0);
-    f.iv_fitted.assign(m.n(), 0.0);
+    f.q.resize(N);
+    f.fitted.resize(m.n());
+    f.iv_fitted.resize(m.n());
 
     f.kernel_dirty = true;
     f.fit_dirty = true;
@@ -199,23 +189,23 @@ void Surface::setup_expiry(int j) {
 void Surface::build_kernel(int j) {
     auto& m = markets_[j];
     auto& f = fits_[j];
+
+    // Check cache: skip if ATM var hasn't changed significantly
+    if (!f.kernel_dirty && f.cached_atm_var > 0.0) {
+        double rel_change = std::abs(f.atm_var - f.cached_atm_var) / f.cached_atm_var;
+        if (rel_change < cfg_.kernel_cache_tol) return;
+    }
+
     int N = f.N();
     int n_mkt = m.n();
-
-    // Variance for kernel: eta * atm_var = vol_fac^2 * atm_iv^2 * T
     double variance = cfg_.eta * f.atm_var;
 
-    // C_market: maps q -> prices at market strikes
-    // If we have a direct index mapping, we could use it, but for generality
-    // we compute the full kernel for market strikes
     fill_kernel_matrix(f.C_market, m.strikes.data(), n_mkt,
                        f.model_strikes.data(), N, variance);
 
-    // Build Hessian H = C^T W^2 C + lambda I
     compute_hessian(f.H, f.C_market, m.weights.data(),
                     cfg_.smoothness_penalty / N, N);
 
-    // Equality constraints: sum(q)=1, K^T q=1
     f.A_eq.assign(2 * N, 0.0);
     f.b_eq.assign(2, 0.0);
     for (int i = 0; i < N; ++i) {
@@ -225,29 +215,23 @@ void Surface::build_kernel(int j) {
     f.b_eq[0] = 1.0;
     f.b_eq[1] = 1.0;
 
-    // No hard inequality constraints — non-negativity and normalization
-    // are handled directly by simplex projection in the solver.
-    // Term-structure monotonicity is enforced as a soft post-hoc check.
     f.A_ineq.clear();
     f.b_ineq.clear();
 
+    f.cached_atm_var = f.atm_var;
     f.kernel_dirty = false;
+
+    // Invalidate Cholesky cache in QP workspace since H changed
+    f.qp_ws.n = 0;
 }
 
 void Surface::build_qp(int j) {
-    auto& m = markets_[j];
     auto& f = fits_[j];
+    auto& m = markets_[j];
 
-    // Update linear term: f = -C^T W^2 mid
     f.f.resize(f.N());
     compute_gradient(f.f.data(), f.C_market, m.weights.data(),
                      m.mids.data(), m.n(), f.N());
-
-    // If using penalty mode, adjust objective for bid/ask violations
-    // The QP objective is: 0.5 q^T H q + f^T q
-    // This gives a least-squares fit to mid weighted by spreads.
-    // Bid/ask penalties are handled post-hoc or via constraint mode.
-
     f.fit_dirty = true;
 }
 
@@ -261,8 +245,6 @@ void Surface::solve_expiry(int j) {
     prob.n = N;
     prob.m_ineq = m_ineq;
     prob.m_eq = m_eq;
-    // H is stored column-major in DenseMat but QP expects row-major.
-    // Since H is symmetric, column-major == row-major.
     prob.H = f.H.data.data();
     prob.f = f.f.data();
     prob.A_ineq = m_ineq > 0 ? f.A_ineq.data() : nullptr;
@@ -270,40 +252,32 @@ void Surface::solve_expiry(int j) {
     prob.A_eq = f.A_eq.data();
     prob.b_eq = f.b_eq.data();
 
-    // Warm start from previous solution if available
     const double* warm = nullptr;
-    bool has_prev = false;
-    for (int i = 0; i < N; ++i) {
-        if (f.q[i] != 0.0) { has_prev = true; break; }
-    }
-    if (has_prev) warm = f.q.data();
+    for (int i = 0; i < N; ++i)
+        if (f.q[i] != 0.0) { warm = f.q.data(); break; }
 
-    QPResult res = qp_solve(
-        f.q.data(), prob, f.qp_ws,
-        cfg_.qp_tol, cfg_.max_qp_iters, warm);
+    qp_solve(f.q.data(), prob, f.qp_ws, cfg_.qp_tol, cfg_.max_qp_iters, warm);
 
-    // Ensure non-negativity and normalization
     double qsum = 0.0;
     for (int i = 0; i < N; ++i) {
         f.q[i] = std::max(f.q[i], 0.0);
         qsum += f.q[i];
     }
-    if (qsum > 0.0) {
+    if (qsum > 0.0)
         for (int i = 0; i < N; ++i) f.q[i] /= qsum;
-    }
 
-    // Compute fitted prices at market strikes: fitted = C_market * q
     mat_vec(f.fitted.data(), f.C_market, f.q.data());
 
-    // Compute fitted IVs
-    auto& m = markets_[j];
-    for (int i = 0; i < m.n(); ++i) {
-        iv::Status st;
-        double v = iv::implied_volatility(1.0, m.strikes[i], f.fitted[i], m.T(), true, &st);
-        f.iv_fitted[i] = st.ok ? v : 0.0;
-    }
-
+    // Skip fitted IV computation here — compute on demand in vol_grid()
     f.fit_dirty = false;
+}
+
+// Process one expiry end-to-end (for parallel dispatch)
+void Surface::calibrate_expiry(int j) {
+    setup_expiry(j);
+    build_kernel(j);
+    build_qp(j);
+    solve_expiry(j);
 }
 
 void Surface::eval_model(int j, const double* strikes, int n, double* prices) const {
@@ -312,7 +286,6 @@ void Surface::eval_model(int j, const double* strikes, int n, double* prices) co
     int N = f.N();
 
     if (variance <= 0.0) {
-        // Linear mode
         for (int l = 0; l < n; ++l) {
             double price = 0.0;
             for (int i = 0; i < N; ++i)
@@ -327,7 +300,6 @@ void Surface::eval_model(int j, const double* strikes, int n, double* prices) co
     double inv_sqrt_v = 1.0 / sqrt_v;
 
 #ifdef SANOS_HAS_SIMD_BS
-    // SIMD path: vectorize over model strikes (4 at a time)
     for (int l = 0; l < n; ++l) {
         double K = strikes[l];
         __m256d v_K = _mm256_set1_pd(K);
@@ -343,8 +315,7 @@ void Surface::eval_model(int j, const double* strikes, int n, double* prices) co
             __m256d v_ratio = _mm256_div_pd(v_K, v_ki);
             __m256d v_log_k = simd::fast_log_avx2(v_ratio);
             __m256d v_d1 = _mm256_mul_pd(
-                _mm256_sub_pd(v_half_v, v_log_k),
-                v_inv_sqv);
+                _mm256_sub_pd(v_half_v, v_log_k), v_inv_sqv);
             __m256d v_d2 = _mm256_sub_pd(v_d1, v_sqv);
             __m256d v_phi1 = simd::phicdf_4(v_d1);
             __m256d v_phi2 = simd::phicdf_4(v_d2);
@@ -353,7 +324,6 @@ void Surface::eval_model(int j, const double* strikes, int n, double* prices) co
             v_price = _mm256_fmadd_pd(v_qi, v_call, v_price);
         }
         double price = simd::avx2_reduce_sum(v_price);
-        // Scalar tail
         for (; i < N; ++i) {
             double ratio = K / f.model_strikes[i];
             double log_k = std::log(ratio);
@@ -386,16 +356,26 @@ void Surface::eval_model(int j, const double* strikes, int n, double* prices) co
 
 double Surface::calibrate() {
     auto t0 = std::chrono::high_resolution_clock::now();
-
     int M = n_expiries();
 
-    for (int j = 0; j < M; ++j) compute_iv(j);
-    for (int j = 0; j < M; ++j) setup_expiry(j);
-    for (int j = 0; j < M; ++j) {
-        build_kernel(j);
-        build_qp(j);
-        solve_expiry(j);
+    int n_threads = cfg_.n_threads;
+    if (n_threads <= 0)
+        n_threads = std::max(1, static_cast<int>(std::thread::hardware_concurrency()));
+
+    if (n_threads > 1 && M > 1) {
+        // Parallel: each expiry is independent
+        std::vector<std::future<void>> futures;
+        futures.reserve(M);
+        for (int j = 0; j < M; ++j) {
+            futures.push_back(std::async(std::launch::async, [this, j]() {
+                calibrate_expiry(j);
+            }));
+        }
+        for (auto& fut : futures) fut.get();
+    } else {
+        for (int j = 0; j < M; ++j) calibrate_expiry(j);
     }
+
     update_time_interp();
 
     auto t1 = std::chrono::high_resolution_clock::now();
@@ -407,41 +387,23 @@ double Surface::tick_update(int expiry_idx, int strike_idx, double new_bid, doub
 
     auto& m = markets_[expiry_idx];
 
-    // Update quote
     double intr = std::max(1.0 - m.strikes[strike_idx], 0.0);
     m.bids[strike_idx] = std::max(new_bid, intr);
     m.asks[strike_idx] = std::min(new_ask, 1.0);
     m.spreads[strike_idx] = m.asks[strike_idx] - m.bids[strike_idx];
     m.mids[strike_idx] = 0.5 * (m.bids[strike_idx] + m.asks[strike_idx]);
 
-    // Update weight
     double inv_s = 1.0 / std::max(m.spreads[strike_idx], 1e-12);
     m.weights[strike_idx] = std::min(inv_s, cfg_.max_inv_spread);
 
-    // Renormalize weights
     double wsum = 0.0;
     for (int i = 0; i < m.n(); ++i) wsum += m.weights[i];
-    if (wsum > 0.0) {
+    if (wsum > 0.0)
         for (int i = 0; i < m.n(); ++i) m.weights[i] /= wsum;
-    }
 
-    // Update IV for changed strike using volfi warm restart
-    double h = std::abs(std::log(m.strikes[strike_idx]));
-    double mid_price = m.mids[strike_idx];
-    if (h > 0.0 && mid_price > 0.0 && mid_price < 1.0) {
-        double w_new = iv::implied_variance_warm(h, mid_price, m.w_prev[strike_idx]);
-        m.w_prev[strike_idx] = w_new;
-    }
-
-    // Rebuild QP linear term (Hessian unchanged if kernel unchanged)
     auto& f = fits_[expiry_idx];
     build_qp(expiry_idx);
-
-    // Re-solve this expiry
     solve_expiry(expiry_idx);
-
-    // If this expiry's solution changed, downstream expiries' floors may change too.
-    // For now, only re-solve the changed expiry (iterative mode doesn't propagate forward on tick).
 
     auto t1 = std::chrono::high_resolution_clock::now();
     return std::chrono::duration<double, std::micro>(t1 - t0).count();
@@ -450,43 +412,25 @@ double Surface::tick_update(int expiry_idx, int strike_idx, double new_bid, doub
 double Surface::price(double T, double K) const {
     int M = n_expiries();
     if (M == 0) return 0.0;
-
     if (T <= 0.0) return std::max(1.0 - K, 0.0);
 
-    // Find surrounding expiries
     int j = 0;
     while (j < M && markets_[j].T() < T) ++j;
 
-    if (j >= M) {
-        // Beyond last expiry: extrapolate using last expiry's model
-        double p;
-        eval_model(M - 1, &K, 1, &p);
-        return p;
-    }
+    if (j >= M) { double p; eval_model(M - 1, &K, 1, &p); return p; }
+    if (j == 0 || T <= markets_[0].T()) { double p; eval_model(0, &K, 1, &p); return p; }
 
-    if (j == 0 || T <= markets_[0].T()) {
-        // At or before first expiry
-        double p;
-        eval_model(0, &K, 1, &p);
-        return p;
-    }
-
-    // Interpolate between expiry j-1 and j using ATM variance interpolation
-    double T_lo = markets_[j - 1].T();
-    double T_hi = markets_[j].T();
+    double T_lo = markets_[j - 1].T(), T_hi = markets_[j].T();
     double alpha = (T - T_lo) / (T_hi - T_lo);
-
     double p_lo, p_hi;
     eval_model(j - 1, &K, 1, &p_lo);
     eval_model(j, &K, 1, &p_hi);
-
     return p_lo * (1.0 - alpha) + p_hi * alpha;
 }
 
 double Surface::vol(double T, double K) const {
     double p = price(T, K);
     if (T <= 0.0 || p <= 0.0) return 0.0;
-
     iv::Status st;
     double v = iv::implied_volatility(1.0, K, p, T, true, &st);
     return st.ok ? v : 0.0;
@@ -499,7 +443,6 @@ void Surface::price_grid(int expiry_idx, const double* strikes, int n, double* o
 void Surface::vol_grid(int expiry_idx, const double* strikes, int n, double* out) const {
     AVec<double> prices(n);
     eval_model(expiry_idx, strikes, n, prices.data());
-
     double T = markets_[expiry_idx].T();
     for (int i = 0; i < n; ++i) {
         iv::Status st;
