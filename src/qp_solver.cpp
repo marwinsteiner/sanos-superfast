@@ -2,26 +2,25 @@
 #include <cmath>
 #include <cstring>
 #include <algorithm>
-#include <vector>
 
 namespace sanos {
 
-void QPWorkspace::resize(int n_, int m_total) {
+void QPWorkspace::resize(int n_, int m_eq) {
     if (n == n_) return;
     n = n_;
-    L.resize(n * n);
-    z.resize(n);
-    u.resize(n);
+    H_r.resize(n * n);
+    L_r.resize(n * n);
+    f_r.resize(n);
+    A_r.resize(m_eq * n);
+    Hinv_At.resize(n * m_eq);
     q.resize(n);
-    rhs.resize(n);
-    tmp.resize(std::max(n, std::max(m_total, 1)));
-    tmp2.resize(std::max(n, std::max(m_total, 1)));
-    factored = false;
-    warm = false;
-    cached_rho = -1.0;
+    t1.resize(n);
+    t2.resize(n);
+    t3.resize(n);
+    free_idx.resize(n);
+    free_mask.resize(n);
 }
 
-// Cholesky of symmetric PD matrix A (n×n row-major) into L (lower triangular)
 static bool cholesky_factor(double* L, const double* A, int n) {
     std::memcpy(L, A, n * n * sizeof(double));
     for (int j = 0; j < n; ++j) {
@@ -64,87 +63,52 @@ static void chol_solve(double* x, const double* L, const double* b, double* tmp,
     solve_Lt(x, L, tmp, n);
 }
 
-// Solve the equality-constrained QP using Schur complement:
-//   min 0.5 x^T H x + f^T x  s.t. A_eq x = b_eq
-//
-// KKT: H x + f + A^T lambda = 0, A x = b
-// Via Schur complement:
-//   S = A H^{-1} A^T  (m_eq × m_eq, solve using pre-factored H)
-//   g = -A H^{-1} f - b
-//   S lambda = g
-//   x = H^{-1}(-f - A^T lambda)
-//
-// free_mask: if non-null, only include variables where free_mask[i] is true.
-// Fixed variables are set to 0.
-static void solve_eq_constrained(
+// Solve KKT system for free variables with equality constraints via Schur complement.
+// All buffers are pre-allocated in the workspace.
+static void solve_kkt(
     double* x_out, int n,
     const double* H, const double* f,
     const double* A_eq, const double* b_eq, int m_eq,
-    const char* free_mask,  // null = all free
-    double* L_buf, double* tmp1, double* tmp2, double* tmp3)
+    const int* free_idx, int n_free,
+    // Pre-allocated buffers (all >= n_free*n_free or n_free*m_eq etc.):
+    double* H_r, double* L_r, double* f_r, double* A_r,
+    double* Hinv_At, double* t1, double* t2, double* t3)
 {
-    // Count free variables
-    int n_free = 0;
-    std::vector<int> free_idx;
-    if (free_mask) {
-        for (int i = 0; i < n; ++i) if (free_mask[i]) free_idx.push_back(i);
-        n_free = static_cast<int>(free_idx.size());
-    } else {
-        n_free = n;
-        free_idx.resize(n);
-        for (int i = 0; i < n; ++i) free_idx[i] = i;
-    }
-
     if (n_free == 0) {
         std::memset(x_out, 0, n * sizeof(double));
         return;
     }
 
-    // Build reduced H_r (n_free × n_free) and f_r (n_free)
-    std::vector<double> H_r(n_free * n_free);
-    std::vector<double> f_r(n_free);
-
+    // Build reduced H_r, f_r, A_r from free indices
     for (int i = 0; i < n_free; ++i) {
         f_r[i] = f[free_idx[i]];
         for (int j = 0; j < n_free; ++j)
             H_r[i * n_free + j] = H[free_idx[i] * n + free_idx[j]];
     }
-
-    // Reduced A_eq (m_eq × n_free)
-    std::vector<double> A_r(m_eq * n_free);
     for (int e = 0; e < m_eq; ++e)
         for (int j = 0; j < n_free; ++j)
             A_r[e * n_free + j] = A_eq[e * n + free_idx[j]];
 
     // Factorize reduced H
-    std::vector<double> L_r(n_free * n_free);
-    if (!cholesky_factor(L_r.data(), H_r.data(), n_free)) {
+    if (!cholesky_factor(L_r, H_r, n_free)) {
         for (int i = 0; i < n_free; ++i) H_r[i * n_free + i] += 1e-6;
-        cholesky_factor(L_r.data(), H_r.data(), n_free);
+        cholesky_factor(L_r, H_r, n_free);
     }
 
-    std::vector<double> t1(n_free), t2(n_free), t3(n_free);
-
     if (m_eq == 0) {
-        // No equality constraints: x = H^{-1}(-f)
         for (int i = 0; i < n_free; ++i) t1[i] = -f_r[i];
-        chol_solve(t2.data(), L_r.data(), t1.data(), t3.data(), n_free);
+        chol_solve(t2, L_r, t1, t3, n_free);
         std::memset(x_out, 0, n * sizeof(double));
         for (int i = 0; i < n_free; ++i) x_out[free_idx[i]] = t2[i];
         return;
     }
 
-    // Schur complement: S = A_r H_r^{-1} A_r^T  (m_eq × m_eq)
-    // For m_eq = 2, S is 2x2.
-    std::vector<double> Hinv_At(n_free * m_eq); // H^{-1} A^T, stored as m_eq columns of length n_free
-    for (int e = 0; e < m_eq; ++e) {
-        // Column e: solve H_r v = A_r[e,:]
-        chol_solve(Hinv_At.data() + e * n_free, L_r.data(),
-                   A_r.data() + e * n_free, t3.data(), n_free);
-    }
+    // Schur complement: S = A_r H_r^{-1} A_r^T (m_eq x m_eq)
+    for (int e = 0; e < m_eq; ++e)
+        chol_solve(Hinv_At + e * n_free, L_r, A_r + e * n_free, t3, n_free);
 
-    // S[e1, e2] = A_r[e1,:] * Hinv_At[:,e2]
-    std::vector<double> S(m_eq * m_eq);
+    // S (m_eq x m_eq) — small, computed inline
+    double S[4] = {};  // max m_eq = 2
     for (int e1 = 0; e1 < m_eq; ++e1)
         for (int e2 = 0; e2 < m_eq; ++e2) {
             double sum = 0.0;
@@ -154,31 +118,24 @@ static void solve_eq_constrained(
         }
 
     // g = -A_r H_r^{-1} f_r - b_eq
-    // First: H_r^{-1} f_r
-    for (int i = 0; i < n_free; ++i) t1[i] = f_r[i];
-    chol_solve(t2.data(), L_r.data(), t1.data(), t3.data(), n_free);
-
-    std::vector<double> g(m_eq);
+    chol_solve(t2, L_r, f_r, t3, n_free);
+    double g[2] = {};
     for (int e = 0; e < m_eq; ++e) {
         double sum = 0.0;
         for (int j = 0; j < n_free; ++j) sum += A_r[e * n_free + j] * t2[j];
         g[e] = -sum - b_eq[e];
     }
 
-    // Solve S lambda = g
-    std::vector<double> lambda(m_eq);
+    // Solve S lambda = g (2x2 or 1x1)
+    double lambda[2] = {};
     if (m_eq == 1) {
-        lambda[0] = g[0] / S[0];
-    } else if (m_eq == 2) {
-        double det = S[0] * S[3] - S[1] * S[2];
-        if (std::abs(det) < 1e-30) det = 1e-30;
-        lambda[0] = (S[3] * g[0] - S[1] * g[1]) / det;
-        lambda[1] = (-S[2] * g[0] + S[0] * g[1]) / det;
+        lambda[0] = (std::abs(S[0]) > 1e-30) ? g[0] / S[0] : 0.0;
     } else {
-        // General case: solve S lambda = g via Cholesky
-        std::vector<double> L_s(m_eq * m_eq), ts(m_eq);
-        cholesky_factor(L_s.data(), S.data(), m_eq);
-        chol_solve(lambda.data(), L_s.data(), g.data(), ts.data(), m_eq);
+        double det = S[0] * S[3] - S[1] * S[2];
+        if (std::abs(det) > 1e-30) {
+            lambda[0] = (S[3] * g[0] - S[1] * g[1]) / det;
+            lambda[1] = (-S[2] * g[0] + S[0] * g[1]) / det;
+        }
     }
 
     // x = H^{-1}(-f - A^T lambda)
@@ -188,7 +145,7 @@ static void solve_eq_constrained(
             rhs -= A_r[e * n_free + i] * lambda[e];
         t1[i] = rhs;
     }
-    chol_solve(t2.data(), L_r.data(), t1.data(), t3.data(), n_free);
+    chol_solve(t2, L_r, t1, t3, n_free);
 
     std::memset(x_out, 0, n * sizeof(double));
     for (int i = 0; i < n_free; ++i) x_out[free_idx[i]] = t2[i];
@@ -203,107 +160,86 @@ QPResult qp_solve(
     const double* warm_x)
 {
     const int n = prob.n;
-    ws.resize(n, prob.m_eq + prob.m_ineq);
+    const int m_eq = prob.m_eq;
+    ws.resize(n, m_eq);
 
     QPResult result;
     double* q = ws.q.data();
+    char* fmask = ws.free_mask.data();
+    int* fidx = ws.free_idx.data();
 
-    // Active-set method with Schur complement KKT solve.
-    // Active set = indices where q_i is fixed to 0 (binding non-negativity).
-    std::vector<char> free_mask(n, true);
-
-    // Initialize active set from warm start hint
+    // Initialize active set
     if (warm_x) {
         for (int i = 0; i < n; ++i)
-            free_mask[i] = (warm_x[i] > 1e-12);
+            fmask[i] = (warm_x[i] > 1e-12) ? 1 : 0;
+    } else {
+        std::memset(fmask, 1, n);
     }
 
     for (int iter = 0; iter < max_iters; ++iter) {
         result.iters = iter + 1;
 
-        // Solve equality-constrained QP on free variables
-        solve_eq_constrained(q, n, prob.H, prob.f,
-                             prob.A_eq, prob.b_eq, prob.m_eq,
-                             free_mask.data(),
-                             ws.L.data(), ws.tmp.data(), ws.tmp2.data(), ws.rhs.data());
+        // Build free index list
+        int nf = 0;
+        for (int i = 0; i < n; ++i)
+            if (fmask[i]) fidx[nf++] = i;
 
-        // Check for negative components and add to active set
-        bool changed = false;
-        int most_neg_idx = -1;
-        double most_neg = 0.0;
+        // Solve KKT on free variables
+        solve_kkt(q, n, prob.H, prob.f, prob.A_eq, prob.b_eq, m_eq,
+                  fidx, nf,
+                  ws.H_r.data(), ws.L_r.data(), ws.f_r.data(), ws.A_r.data(),
+                  ws.Hinv_At.data(), ws.t1.data(), ws.t2.data(), ws.t3.data());
+
+        // Batch-add ALL negative free variables to active set at once
+        int n_neg = 0;
         for (int i = 0; i < n; ++i) {
-            if (free_mask[i] && q[i] < -tol) {
-                if (q[i] < most_neg) {
-                    most_neg = q[i];
-                    most_neg_idx = i;
+            if (fmask[i] && q[i] < -tol) {
+                fmask[i] = 0;
+                q[i] = 0.0;
+                n_neg++;
+            }
+        }
+
+        if (n_neg > 0) continue;
+
+        // All free variables non-negative. Check dual feasibility for active variables.
+        // grad_i = (Hq + f)_i. For active q_i=0, we need grad_i >= 0 (multiplier non-negative).
+        int release = -1;
+        double worst_grad = 0.0;
+        for (int i = 0; i < n; ++i) {
+            if (!fmask[i]) {
+                double gi = prob.f[i];
+                for (int j = 0; j < n; ++j) gi += prob.H[i * n + j] * q[j];
+                if (gi < -tol && gi < worst_grad) {
+                    worst_grad = gi;
+                    release = i;
                 }
             }
         }
 
-        if (most_neg_idx >= 0) {
-            // Add most negative to active set
-            free_mask[most_neg_idx] = false;
-            q[most_neg_idx] = 0.0;
-            changed = true;
+        if (release >= 0) {
+            fmask[release] = 1;
+            continue;
         }
 
-        if (!changed) {
-            // All free variables non-negative. Check dual feasibility:
-            // For active variables, the gradient (reduced cost) should be >= 0
-            // grad_i = (Hq + f)_i + sum_e lambda_e * A_eq[e,i]
-            // We need to compute the gradient at the current q.
-            bool dual_ok = true;
-            int worst_dual_idx = -1;
-            double worst_dual = 0.0;
-
-            for (int i = 0; i < n; ++i) {
-                if (!free_mask[i]) {
-                    // Compute gradient component
-                    double gi = prob.f[i];
-                    for (int j = 0; j < n; ++j) gi += prob.H[i * n + j] * q[j];
-                    // For non-negativity constraint q_i >= 0, the dual variable is -gi
-                    // It should be >= 0, so gi should be <= 0... wait.
-                    // Actually: the KKT condition is H q + f + A^T lambda - mu = 0
-                    // where mu >= 0 are multipliers for q >= 0.
-                    // For active constraint q_i = 0: mu_i = (H q + f + A^T lambda)_i
-                    // We want mu_i >= 0.
-                    // Without computing lambda explicitly, we can check:
-                    // If releasing q_i from 0 would decrease the objective, then mu_i < 0.
-                    // This happens when gi < 0 (gradient points into the feasible region).
-                    if (gi < -tol && gi < worst_dual) {
-                        worst_dual = gi;
-                        worst_dual_idx = i;
-                    }
-                }
-            }
-
-            if (worst_dual_idx >= 0) {
-                // Release this variable from active set
-                free_mask[worst_dual_idx] = true;
-                changed = true;
-            }
-
-            if (!changed) {
-                result.status = QPStatus::Optimal;
-                break;
-            }
-        }
-
-        if (iter == max_iters - 1)
-            result.status = QPStatus::MaxIters;
+        // Optimal
+        result.status = QPStatus::Optimal;
+        break;
     }
 
-    // Ensure non-negativity (numerical cleanup)
+    if (result.iters >= max_iters)
+        result.status = QPStatus::MaxIters;
+
+    // Numerical cleanup
     double qsum = 0.0;
     for (int i = 0; i < n; ++i) {
         q[i] = std::max(q[i], 0.0);
         qsum += q[i];
     }
-    if (qsum > 1e-15) {
+    if (qsum > 1e-15)
         for (int i = 0; i < n; ++i) q[i] /= qsum;
-    }
 
-    // Compute objective
+    // Objective
     double obj = 0.0;
     for (int i = 0; i < n; ++i) {
         obj += prob.f[i] * q[i];

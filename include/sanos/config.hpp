@@ -16,7 +16,7 @@ struct SurfaceConfig {
     double max_k  = 3.0;      // right boundary strike (pure)
 
     // QP solver parameters
-    double smoothness_penalty = 1e-6;  // lambda * ||q||^2 regularizer
+    double smoothness_penalty = 1e-4;  // lambda * ||q||^2 regularizer (prevents ill-conditioning)
     int    max_qp_iters       = 200;   // max active-set pivots
     double qp_tol             = 1e-10; // KKT tolerance
 

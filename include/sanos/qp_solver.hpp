@@ -3,24 +3,17 @@
 
 namespace sanos {
 
-// ADMM-based QP solver for SANOS density estimation.
+// Active-set QP solver with Schur complement KKT solve.
 //
 // Solves:  min  0.5 * x^T H x + f^T x
-//          s.t. A_ineq * x >= b_ineq    (m_ineq inequality constraints)
-//               A_eq   * x  = b_eq      (m_eq   equality constraints)
+//          s.t. A_eq * x = b_eq       (m_eq equality constraints)
+//               x >= 0                (non-negativity, handled by active set)
 //
-// Uses ADMM splitting: min g(q) + I_C(z) s.t. q = z
-// where g(q) = 0.5 q^T H q + f^T q and C is the constraint set.
-//
-// q-update: q = (H + rho*I)^{-1} (rho*(z - u) - f)   [cached Cholesky]
-// z-update: z = project_C(q + u)
-// u-update: u += q - z
+// H must be symmetric positive definite (n x n, row-major).
+// For SANOS: m_eq = 2 (sum=1, K^T q=1), plus non-negativity q >= 0.
+// Inequality constraints (floor) are not supported in this fast solver.
 
-enum class QPStatus {
-    Optimal,
-    MaxIters,
-    NumericalError
-};
+enum class QPStatus { Optimal, MaxIters, NumericalError };
 
 struct QPResult {
     QPStatus status = QPStatus::Optimal;
@@ -30,34 +23,31 @@ struct QPResult {
 
 struct QPProblem {
     int n       = 0;
-    int m_ineq  = 0;
+    int m_ineq  = 0;  // unused in fast solver (kept for API compat)
     int m_eq    = 0;
 
-    const double* H      = nullptr;  // n x n (row-major, symmetric)
-    const double* f      = nullptr;  // n
-    const double* A_ineq = nullptr;  // m_ineq x n (row-major)
-    const double* b_ineq = nullptr;  // m_ineq
-    const double* A_eq   = nullptr;  // m_eq x n (row-major)
+    const double* H      = nullptr;
+    const double* f      = nullptr;
+    const double* A_ineq = nullptr;  // unused
+    const double* b_ineq = nullptr;  // unused
+    const double* A_eq   = nullptr;  // m_eq x n row-major
     const double* b_eq   = nullptr;  // m_eq
 };
 
 struct QPWorkspace {
-    // Cholesky of (H + rho*I)
-    AVec<double> L;
-    bool factored = false;
-    double cached_rho = -1.0;
-
-    // ADMM state (warm-started across solves)
-    AVec<double> z;     // consensus variable
-    AVec<double> u;     // scaled dual variable
-    AVec<double> q;     // primal
-    AVec<double> rhs;   // scratch for linear solve
-    AVec<double> tmp;   // scratch
-    AVec<double> tmp2;  // scratch
+    // Pre-allocated buffers (sized for max N)
+    AVec<double> H_r;         // reduced Hessian (n_free x n_free)
+    AVec<double> L_r;         // Cholesky of reduced Hessian
+    AVec<double> f_r;         // reduced gradient
+    AVec<double> A_r;         // reduced equality constraints
+    AVec<double> Hinv_At;     // H^{-1} A^T columns
+    AVec<double> q;           // current solution
+    AVec<double> t1, t2, t3;  // scratch
+    AVec<int>    free_idx;    // indices of free variables
+    AVec<char>   free_mask;   // 1=free, 0=fixed
     int n = 0;
-    bool warm = false;
 
-    void resize(int n_, int m_total);
+    void resize(int n_, int m_eq);
 };
 
 QPResult qp_solve(
