@@ -12,9 +12,10 @@ Calibrates a smooth, arbitrage-free implied volatility surface from option bid/a
 
 | Operation | Median | P95 |
 |-----------|--------|-----|
-| Tick update (1 strike changed) | 92 μs | 174 μs |
-| Full calibration (cold) | 7.5 ms | 11 ms |
-| Surface query (per point) | 4 μs | — |
+| Warm recalibration (all expiries) | 494 μs | 554 μs |
+| Cold calibration (new surface) | 1.57 ms | 2.09 ms |
+| Tick update (1 strike changed) | 79 μs | 101 μs |
+| Surface query (per point) | 4.4 μs | — |
 
 ## Build
 
@@ -34,6 +35,6 @@ cmake --build build --config Release
 ## Run
 
 ```bash
-./build/test_sanos     # 77 unit tests
+./build/test_sanos     # unit tests
 ./build/bench_surface  # benchmark with synthetic SPX data
 ```
