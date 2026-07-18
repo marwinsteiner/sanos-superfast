@@ -2,6 +2,9 @@
 #include "sanos/bs_kernel.hpp"
 #include "sanos/qp_solver.hpp"
 #include "sanos/volfi_compat.hpp"
+#if !defined(SANOS_PURE_MSVC) && (defined(__AVX2__) || defined(__AVX__))
+#include "sanos/simd_bs.hpp"
+#endif
 #include <cmath>
 #include <algorithm>
 #include <cstring>
@@ -305,19 +308,80 @@ void Surface::solve_expiry(int j) {
 
 void Surface::eval_model(int j, const double* strikes, int n, double* prices) const {
     const auto& f = fits_[j];
-    const auto& m = markets_[j];
     double variance = cfg_.eta * f.atm_var;
     int N = f.N();
 
+    if (variance <= 0.0) {
+        // Linear mode
+        for (int l = 0; l < n; ++l) {
+            double price = 0.0;
+            for (int i = 0; i < N; ++i)
+                price += f.q[i] * std::max(f.model_strikes[i] - strikes[l], 0.0);
+            prices[l] = price;
+        }
+        return;
+    }
+
+    double sqrt_v = std::sqrt(variance);
+    double half_v = 0.5 * variance;
+    double inv_sqrt_v = 1.0 / sqrt_v;
+
+#ifdef SANOS_HAS_SIMD_BS
+    // SIMD path: vectorize over model strikes (4 at a time)
     for (int l = 0; l < n; ++l) {
-        double price = 0.0;
-        for (int i = 0; i < N; ++i) {
-            double ratio = strikes[l] / f.model_strikes[i];
-            double call_val = f.model_strikes[i] * bs_call_price(ratio, variance);
-            price += f.q[i] * call_val;
+        double K = strikes[l];
+        __m256d v_K = _mm256_set1_pd(K);
+        __m256d v_half_v = _mm256_set1_pd(half_v);
+        __m256d v_inv_sqv = _mm256_set1_pd(inv_sqrt_v);
+        __m256d v_sqv = _mm256_set1_pd(sqrt_v);
+        __m256d v_price = _mm256_setzero_pd();
+
+        int i = 0;
+        for (; i + 4 <= N; i += 4) {
+            __m256d v_ki = _mm256_loadu_pd(f.model_strikes.data() + i);
+            __m256d v_qi = _mm256_loadu_pd(f.q.data() + i);
+            __m256d v_ratio = _mm256_div_pd(v_K, v_ki);
+            __m256d v_log_k = simd::fast_log_avx2(v_ratio);
+            __m256d v_d1 = _mm256_mul_pd(
+                _mm256_sub_pd(v_half_v, v_log_k),
+                v_inv_sqv);
+            __m256d v_d2 = _mm256_sub_pd(v_d1, v_sqv);
+            __m256d v_phi1 = simd::phicdf_4(v_d1);
+            __m256d v_phi2 = simd::phicdf_4(v_d2);
+            __m256d v_call = _mm256_mul_pd(v_ki,
+                _mm256_sub_pd(v_phi1, _mm256_mul_pd(v_ratio, v_phi2)));
+            v_price = _mm256_fmadd_pd(v_qi, v_call, v_price);
+        }
+        double price = simd::avx2_reduce_sum(v_price);
+        // Scalar tail
+        for (; i < N; ++i) {
+            double ratio = K / f.model_strikes[i];
+            double log_k = std::log(ratio);
+            double d1 = (-log_k + half_v) * inv_sqrt_v;
+            double d2 = d1 - sqrt_v;
+            double phi1 = 0.5 * std::erfc(-d1 * 0.7071067811865475244);
+            double phi2 = 0.5 * std::erfc(-d2 * 0.7071067811865475244);
+            price += f.q[i] * f.model_strikes[i] * (phi1 - ratio * phi2);
         }
         prices[l] = price;
     }
+#else
+    for (int l = 0; l < n; ++l) {
+        double K = strikes[l];
+        double price = 0.0;
+        for (int i = 0; i < N; ++i) {
+            double ratio = K / f.model_strikes[i];
+            if (ratio <= 0.0) { price += f.q[i] * f.model_strikes[i]; continue; }
+            double log_k = std::log(ratio);
+            double d1 = (-log_k + half_v) * inv_sqrt_v;
+            double d2 = d1 - sqrt_v;
+            double phi1 = 0.5 * std::erfc(-d1 * 0.7071067811865475244);
+            double phi2 = 0.5 * std::erfc(-d2 * 0.7071067811865475244);
+            price += f.q[i] * f.model_strikes[i] * (phi1 - ratio * phi2);
+        }
+        prices[l] = price;
+    }
+#endif
 }
 
 double Surface::calibrate() {

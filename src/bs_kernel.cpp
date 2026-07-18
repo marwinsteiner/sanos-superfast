@@ -1,4 +1,5 @@
 #include "sanos/bs_kernel.hpp"
+#include "sanos/volfi_compat.hpp"
 #include <cmath>
 #include <algorithm>
 #include <cstring>
@@ -7,6 +8,11 @@
 #include <immintrin.h>
 #else
 #include <x86intrin.h>
+#endif
+
+// SIMD BS pricing (Clang/GCC only — uses volfi's AVX2 log/erfc)
+#if !defined(SANOS_PURE_MSVC) && (defined(__AVX2__) || defined(__AVX__))
+#include "sanos/simd_bs.hpp"
 #endif
 
 namespace sanos {
@@ -53,6 +59,14 @@ void fill_kernel_matrix(
             }
         }
     } else {
+#ifdef SANOS_HAS_SIMD_BS
+        // SIMD path: 4-wide AVX2 BS pricing per column
+        for (int i = 0; i < n_model; ++i) {
+            simd::fill_kernel_column_avx2(
+                out.col_ptr(i), eval_strikes, n_eval,
+                model_strikes[i], variance);
+        }
+#else
         for (int i = 0; i < n_model; ++i) {
             double* col = out.col_ptr(i);
             double ki = model_strikes[i];
@@ -66,6 +80,7 @@ void fill_kernel_matrix(
                 col[l] = ki * (phi_cdf(d1) - ratio * phi_cdf(d2));
             }
         }
+#endif
     }
 }
 
@@ -92,6 +107,13 @@ void fill_cross_kernel(
             }
         }
     } else {
+#ifdef SANOS_HAS_SIMD_BS
+        for (int i = 0; i < n_prev; ++i) {
+            simd::fill_kernel_column_avx2(
+                out.col_ptr(i), cur_model_strikes, n_cur,
+                prev_model_strikes[i], prev_variance);
+        }
+#else
         for (int i = 0; i < n_prev; ++i) {
             double* col = out.col_ptr(i);
             double ki = prev_model_strikes[i];
@@ -105,6 +127,7 @@ void fill_cross_kernel(
                 col[l] = ki * (phi_cdf(d1) - ratio * phi_cdf(d2));
             }
         }
+#endif
     }
 }
 
