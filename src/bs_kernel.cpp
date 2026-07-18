@@ -3,6 +3,12 @@
 #include <algorithm>
 #include <cstring>
 
+#ifdef _MSC_VER
+#include <immintrin.h>
+#else
+#include <x86intrin.h>
+#endif
+
 namespace sanos {
 
 static inline double phi_cdf(double x) {
@@ -29,8 +35,16 @@ void fill_kernel_matrix(
     double variance)
 {
     out.resize(n_eval, n_model);
+
+    // Pre-hoist sqrt(variance) — avoids n_eval * n_model redundant sqrts
+    double sqrt_v = 0.0, half_v = 0.0, inv_sqrt_v = 0.0;
+    if (variance > 0.0) {
+        sqrt_v = std::sqrt(variance);
+        half_v = 0.5 * variance;
+        inv_sqrt_v = 1.0 / sqrt_v;
+    }
+
     if (variance <= 0.0) {
-        // Linear mode: C[l,i] = max(model_strikes[i] - eval_strikes[l], 0)
         for (int i = 0; i < n_model; ++i) {
             double* col = out.col_ptr(i);
             double ki = model_strikes[i];
@@ -42,9 +56,14 @@ void fill_kernel_matrix(
         for (int i = 0; i < n_model; ++i) {
             double* col = out.col_ptr(i);
             double ki = model_strikes[i];
+            double inv_ki = 1.0 / ki;
             for (int l = 0; l < n_eval; ++l) {
-                double ratio = eval_strikes[l] / ki;
-                col[l] = ki * bs_call_price(ratio, variance);
+                double ratio = eval_strikes[l] * inv_ki;
+                if (ratio <= 0.0) { col[l] = ki; continue; }
+                double log_k = std::log(ratio);
+                double d1 = (-log_k + half_v) * inv_sqrt_v;
+                double d2 = d1 - sqrt_v;
+                col[l] = ki * (phi_cdf(d1) - ratio * phi_cdf(d2));
             }
         }
     }
@@ -57,6 +76,13 @@ void fill_cross_kernel(
     double prev_variance)
 {
     out.resize(n_cur, n_prev);
+    double sqrt_v = 0.0, half_v = 0.0, inv_sqrt_v = 0.0;
+    if (prev_variance > 0.0) {
+        sqrt_v = std::sqrt(prev_variance);
+        half_v = 0.5 * prev_variance;
+        inv_sqrt_v = 1.0 / sqrt_v;
+    }
+
     if (prev_variance <= 0.0) {
         for (int i = 0; i < n_prev; ++i) {
             double* col = out.col_ptr(i);
@@ -69,12 +95,40 @@ void fill_cross_kernel(
         for (int i = 0; i < n_prev; ++i) {
             double* col = out.col_ptr(i);
             double ki = prev_model_strikes[i];
+            double inv_ki = 1.0 / ki;
             for (int l = 0; l < n_cur; ++l) {
-                double ratio = cur_model_strikes[l] / ki;
-                col[l] = ki * bs_call_price(ratio, prev_variance);
+                double ratio = cur_model_strikes[l] * inv_ki;
+                if (ratio <= 0.0) { col[l] = ki; continue; }
+                double log_k = std::log(ratio);
+                double d1 = (-log_k + half_v) * inv_sqrt_v;
+                double d2 = d1 - sqrt_v;
+                col[l] = ki * (phi_cdf(d1) - ratio * phi_cdf(d2));
             }
         }
     }
+}
+
+// --- AVX2 helpers ---
+
+#if defined(__AVX2__) || defined(__AVX__)
+#define SANOS_HAS_AVX2 1
+#endif
+
+// MSVC with /arch:AVX2 defines __AVX2__. If not, fall back to scalar.
+#ifdef SANOS_HAS_AVX2
+
+static inline __m256d avx2_hsum_partial(__m256d v) {
+    // Returns the horizontal sum in all lanes (approximately)
+    __m256d s = _mm256_hadd_pd(v, v); // [a+b, a+b, c+d, c+d]
+    return s;
+}
+
+static inline double avx2_hsum(__m256d v) {
+    __m128d lo = _mm256_castpd256_pd128(v);
+    __m128d hi = _mm256_extractf128_pd(v, 1);
+    __m128d s  = _mm_add_pd(lo, hi);
+    s = _mm_hadd_pd(s, s);
+    return _mm_cvtsd_f64(s);
 }
 
 void mat_vec(double* y, const DenseMat& A, const double* x) {
@@ -82,10 +136,16 @@ void mat_vec(double* y, const DenseMat& A, const double* x) {
     std::memset(y, 0, m * sizeof(double));
     for (int j = 0; j < n; ++j) {
         const double* col = A.col_ptr(j);
-        double xj = x[j];
-        for (int i = 0; i < m; ++i) {
-            y[i] += col[i] * xj;
+        __m256d vxj = _mm256_set1_pd(x[j]);
+        int i = 0;
+        for (; i + 4 <= m; i += 4) {
+            __m256d vy = _mm256_loadu_pd(y + i);
+            __m256d vc = _mm256_loadu_pd(col + i);
+            vy = _mm256_fmadd_pd(vc, vxj, vy);
+            _mm256_storeu_pd(y + i, vy);
         }
+        double xj = x[j];
+        for (; i < m; ++i) y[i] += col[i] * xj;
     }
 }
 
@@ -93,10 +153,15 @@ void mat_t_vec(double* y, const DenseMat& A, const double* x) {
     int m = A.rows, n = A.cols;
     for (int j = 0; j < n; ++j) {
         const double* col = A.col_ptr(j);
-        double sum = 0.0;
-        for (int i = 0; i < m; ++i) {
-            sum += col[i] * x[i];
+        __m256d vsum = _mm256_setzero_pd();
+        int i = 0;
+        for (; i + 4 <= m; i += 4) {
+            __m256d vc = _mm256_loadu_pd(col + i);
+            __m256d vx = _mm256_loadu_pd(x + i);
+            vsum = _mm256_fmadd_pd(vc, vx, vsum);
         }
+        double sum = avx2_hsum(vsum);
+        for (; i < m; ++i) sum += col[i] * x[i];
         y[j] = sum;
     }
 }
@@ -111,8 +176,93 @@ void compute_hessian(
     int m = C.rows;
     H.resize(n, n);
 
+    // Pre-compute w^2
+    AVec<double> w2(m);
+    for (int i = 0; i < m; ++i) w2[i] = weights[i] * weights[i];
+
     // H = C^T diag(w^2) C + lambda I
-    // H[j,k] = sum_i  C[i,j] * w[i]^2 * C[i,k]
+    for (int j = 0; j < n; ++j) {
+        const double* cj = C.col_ptr(j);
+        for (int k = j; k < n; ++k) {
+            const double* ck = C.col_ptr(k);
+            __m256d vsum = _mm256_setzero_pd();
+            int i = 0;
+            for (; i + 4 <= m; i += 4) {
+                __m256d vcj = _mm256_loadu_pd(cj + i);
+                __m256d vck = _mm256_loadu_pd(ck + i);
+                __m256d vw2 = _mm256_loadu_pd(w2.data() + i);
+                vsum = _mm256_fmadd_pd(_mm256_mul_pd(vcj, vw2), vck, vsum);
+            }
+            double sum = avx2_hsum(vsum);
+            for (; i < m; ++i) sum += cj[i] * w2[i] * ck[i];
+            if (j == k) sum += lambda;
+            H(j, k) = sum;
+            H(k, j) = sum;
+        }
+    }
+}
+
+void compute_gradient(
+    double* f,
+    const DenseMat& C,
+    const double* weights,
+    const double* mid,
+    int m, int n)
+{
+    // Pre-compute w^2 * mid
+    AVec<double> w2mid(m);
+    for (int i = 0; i < m; ++i) {
+        double wi = weights[i];
+        w2mid[i] = wi * wi * mid[i];
+    }
+
+    // f = -C^T (w^2 * mid)
+    for (int j = 0; j < n; ++j) {
+        const double* cj = C.col_ptr(j);
+        __m256d vsum = _mm256_setzero_pd();
+        int i = 0;
+        for (; i + 4 <= m; i += 4) {
+            __m256d vc  = _mm256_loadu_pd(cj + i);
+            __m256d vwm = _mm256_loadu_pd(w2mid.data() + i);
+            vsum = _mm256_fmadd_pd(vc, vwm, vsum);
+        }
+        double sum = avx2_hsum(vsum);
+        for (; i < m; ++i) sum += cj[i] * w2mid[i];
+        f[j] = -sum;
+    }
+}
+
+#else // No AVX2 — scalar fallback
+
+void mat_vec(double* y, const DenseMat& A, const double* x) {
+    int m = A.rows, n = A.cols;
+    std::memset(y, 0, m * sizeof(double));
+    for (int j = 0; j < n; ++j) {
+        const double* col = A.col_ptr(j);
+        double xj = x[j];
+        for (int i = 0; i < m; ++i) y[i] += col[i] * xj;
+    }
+}
+
+void mat_t_vec(double* y, const DenseMat& A, const double* x) {
+    int m = A.rows, n = A.cols;
+    for (int j = 0; j < n; ++j) {
+        const double* col = A.col_ptr(j);
+        double sum = 0.0;
+        for (int i = 0; i < m; ++i) sum += col[i] * x[i];
+        y[j] = sum;
+    }
+}
+
+void compute_hessian(
+    DenseMat& H,
+    const DenseMat& C,
+    const double* weights,
+    double lambda,
+    int n)
+{
+    int m = C.rows;
+    H.resize(n, n);
     for (int j = 0; j < n; ++j) {
         const double* cj = C.col_ptr(j);
         for (int k = j; k < n; ++k) {
@@ -136,7 +286,6 @@ void compute_gradient(
     const double* mid,
     int m, int n)
 {
-    // f = -C^T W^2 mid
     for (int j = 0; j < n; ++j) {
         const double* cj = C.col_ptr(j);
         double sum = 0.0;
@@ -147,5 +296,7 @@ void compute_gradient(
         f[j] = -sum;
     }
 }
+
+#endif // SANOS_HAS_AVX2
 
 } // namespace sanos
