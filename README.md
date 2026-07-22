@@ -35,5 +35,6 @@ cmake --build build --config Release
 
 ```bash
 ./build/test_sanos     # unit tests
-./build/bench_surface  # benchmark with synthetic SPX data
+./build/bench_surface  # benchmark
+uv run scripts/fetch_spx_options.py  # fetch fresh SPX option chain
 ```
