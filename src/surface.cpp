@@ -368,12 +368,24 @@ double Surface::calibrate() {
     auto t0 = std::chrono::high_resolution_clock::now();
     int M = n_expiries();
 
+    // Build priority order: shortest DTE first so near-term expiries
+    // are available for hedging as soon as possible.
+    // The thread pool's work-stealing picks tasks in index order,
+    // so sorting by urgency means the most important expiries finish first.
+    AVec<int> order(M);
+    for (int j = 0; j < M; ++j) order[j] = j;
+    std::sort(order.begin(), order.end(), [this](int a, int b) {
+        return markets_[a].T() < markets_[b].T();
+    });
+
     ensure_pool();
 
     if (pool_ && M > 1) {
-        pool_->parallel_for(M, [this](int j) { calibrate_expiry(j); });
+        pool_->parallel_for(M, [this, &order](int idx) {
+            calibrate_expiry(order[idx]);
+        });
     } else {
-        for (int j = 0; j < M; ++j) calibrate_expiry(j);
+        for (int idx = 0; idx < M; ++idx) calibrate_expiry(order[idx]);
     }
 
     update_time_interp();
