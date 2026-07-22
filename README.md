@@ -10,12 +10,12 @@ Calibrates a smooth, arbitrage-free implied volatility surface from option bid/a
 
 15 expiries, 900 total strikes, Clang 22.1.8, AVX2:
 
-| Operation | Median | P95 |
-|-----------|--------|-----|
-| Warm recalibration (all expiries) | 494 μs | 554 μs |
-| Cold calibration (new surface) | 1.57 ms | 2.09 ms |
-| Tick update (1 strike changed) | 79 μs | 101 μs |
-| Surface query (per point) | 4.4 μs | — |
+| Operation | Median | P95 | Min |
+|-----------|--------|-----|-----|
+| Warm recalibration (all expiries) | 340 μs | 397 μs | 306 μs |
+| Cold calibration (new surface) | 1.19 ms | 1.58 ms | 866 μs |
+| Tick update (1 strike changed) | 79 μs | 101 μs | — |
+| Surface query (per point) | 3.8 μs | — | — |
 
 ## Build
 
