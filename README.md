@@ -4,11 +4,11 @@ Fast C++17 implied volatility surface calibration using the [SANOS methodology](
 
 ## What it does
 
-Calibrates a smooth, arbitrage-free implied volatility surface from option bid/ask quotes using the SANOS methodology, benchmarked against a generator.
+Calibrates a smooth, arbitrage-free implied volatility surface from option bid/ask quotes using the SANOS methodology. Fits real (delayed) SPX option data fetched from Yahoo Finance via `scripts/fetch_spx_options.py`.
 
 ## Performance
 
-15 expiries, 900 total strikes, Clang 22.1.8, AVX2:
+20 expiries, 2298 total strikes (real SPX chain), Clang 22.1.8, AVX2:
 
 | Operation | Median | P95 | Min |
 |-----------|--------|-----|-----|
