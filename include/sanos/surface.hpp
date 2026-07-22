@@ -2,6 +2,7 @@
 #include "config.hpp"
 #include "expiry_data.hpp"
 #include "thread_pool.hpp"
+#include "tick_queue.hpp"
 #include <vector>
 #include <memory>
 
@@ -30,6 +31,10 @@ public:
 
     double calibrate();
     double tick_update(int expiry_idx, int strike_idx, double new_bid, double new_ask);
+
+    // Batch tick update: apply multiple updates, re-solve only affected expiries once each.
+    // Returns solve time in microseconds.
+    double batch_update(const TickUpdate* ticks, int n_ticks);
 
     double price(double T, double K) const;
     double vol(double T, double K) const;

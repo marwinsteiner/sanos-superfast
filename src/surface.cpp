@@ -416,6 +416,53 @@ double Surface::tick_update(int expiry_idx, int strike_idx, double new_bid, doub
     return std::chrono::duration<double, std::micro>(t1 - t0).count();
 }
 
+double Surface::batch_update(const TickUpdate* ticks, int n_ticks) {
+    auto t0 = std::chrono::high_resolution_clock::now();
+    int M = n_expiries();
+
+    // Apply all quote updates, track which expiries are dirty
+    AVec<char> dirty(M, 0);
+    for (int t = 0; t < n_ticks; ++t) {
+        int ej = ticks[t].expiry_idx;
+        int si = ticks[t].strike_idx;
+        if (ej < 0 || ej >= M) continue;
+        auto& m = markets_[ej];
+        if (si < 0 || si >= m.n()) continue;
+
+        double intr = std::max(1.0 - m.strikes[si], 0.0);
+        m.bids[si] = std::max(ticks[t].new_bid, intr);
+        m.asks[si] = std::min(ticks[t].new_ask, 1.0);
+        m.spreads[si] = m.asks[si] - m.bids[si];
+        m.mids[si] = 0.5 * (m.bids[si] + m.asks[si]);
+
+        double inv_s = 1.0 / std::max(m.spreads[si], 1e-12);
+        m.weights[si] = std::min(inv_s, cfg_.max_inv_spread);
+        dirty[ej] = 1;
+    }
+
+    // Renormalize weights and update w2 only for dirty expiries
+    for (int j = 0; j < M; ++j) {
+        if (!dirty[j]) continue;
+        auto& m = markets_[j];
+        auto& f = fits_[j];
+        double wsum = 0.0;
+        for (int i = 0; i < m.n(); ++i) wsum += m.weights[i];
+        if (wsum > 0.0)
+            for (int i = 0; i < m.n(); ++i) m.weights[i] /= wsum;
+        for (int i = 0; i < m.n(); ++i) f.w2[i] = m.weights[i] * m.weights[i];
+    }
+
+    // Re-solve only dirty expiries
+    for (int j = 0; j < M; ++j) {
+        if (!dirty[j]) continue;
+        build_qp(j);
+        solve_expiry(j);
+    }
+
+    auto t1 = std::chrono::high_resolution_clock::now();
+    return std::chrono::duration<double, std::micro>(t1 - t0).count();
+}
+
 double Surface::price(double T, double K) const {
     int M = n_expiries();
     if (M == 0) return 0.0;
