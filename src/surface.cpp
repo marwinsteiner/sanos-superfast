@@ -86,30 +86,26 @@ void Surface::add_expiry(
     ExpiryMarket m;
     m.label = label;
     m.sqrtT = sqrtT;
-    m.strikes.assign(strikes, strikes + n);
-    m.bids.assign(bids, bids + n);
-    m.asks.assign(asks, asks + n);
-    m.mids.resize(n);
-    m.spreads.resize(n);
-    m.weights.resize(n);
-    m.iv_bids.resize(n);
-    m.iv_asks.resize(n);
-    m.w_prev.assign(n, 0.0);
+    m.alloc(n);
+    std::memcpy(m.strikes(), strikes, n * sizeof(double));
+    std::memcpy(m.bids(), bids, n * sizeof(double));
+    std::memcpy(m.asks(), asks, n * sizeof(double));
+    std::memset(m.w_prev(), 0, n * sizeof(double));
 
     for (int i = 0; i < n; ++i) {
-        double intr = std::max(1.0 - strikes[i], 0.0);
-        m.bids[i] = std::max(m.bids[i], intr);
-        m.asks[i] = std::min(m.asks[i], 1.0);
-        m.spreads[i] = m.asks[i] - m.bids[i];
-        m.mids[i] = 0.5 * (m.bids[i] + m.asks[i]);
-        double inv_spread = 1.0 / std::max(m.spreads[i], 1e-12);
-        m.weights[i] = std::min(inv_spread, cfg_.max_inv_spread);
+        double intr = std::max(1.0 - m.strikes()[i], 0.0);
+        m.bids()[i] = std::max(m.bids()[i], intr);
+        m.asks()[i] = std::min(m.asks()[i], 1.0);
+        m.spreads()[i] = m.asks()[i] - m.bids()[i];
+        m.mids()[i] = 0.5 * (m.bids()[i] + m.asks()[i]);
+        double inv_spread = 1.0 / std::max(m.spreads()[i], 1e-12);
+        m.weights()[i] = std::min(inv_spread, cfg_.max_inv_spread);
     }
 
     double wsum = 0.0;
-    for (int i = 0; i < n; ++i) wsum += m.weights[i];
+    for (int i = 0; i < n; ++i) wsum += m.weights()[i];
     if (wsum > 0.0)
-        for (int i = 0; i < n; ++i) m.weights[i] /= wsum;
+        for (int i = 0; i < n; ++i) m.weights()[i] /= wsum;
 
     markets_.push_back(std::move(m));
     fits_.emplace_back();
@@ -132,9 +128,9 @@ void Surface::set_market(
 // Fast ATM vol: only compute IV for the two strikes bracketing K=1
 static double fast_atm_vol(const ExpiryMarket& m) {
     for (int i = 0; i < m.n() - 1; ++i) {
-        if (m.strikes[i] <= 1.0 && m.strikes[i + 1] > 1.0) {
-            double t = (1.0 - m.strikes[i]) / (m.strikes[i + 1] - m.strikes[i]);
-            double mid_lo = m.mids[i], mid_hi = m.mids[i + 1];
+        if (m.strikes()[i] <= 1.0 && m.strikes()[i + 1] > 1.0) {
+            double t = (1.0 - m.strikes()[i]) / (m.strikes()[i + 1] - m.strikes()[i]);
+            double mid_lo = m.mids()[i], mid_hi = m.mids()[i + 1];
             double mid_atm = mid_lo * (1.0 - t) + mid_hi * t;
 
             // Single IV call for ATM mid price
@@ -151,17 +147,17 @@ void Surface::compute_iv(int j) {
     int n = m.n();
 
     for (int i = 0; i < n; ++i) {
-        double K = m.strikes[i];
+        double K = m.strikes()[i];
         iv::Status st;
 
-        double bid_vol = iv::implied_volatility(1.0, K, m.bids[i], m.T(), true, &st);
-        m.iv_bids[i] = st.ok ? bid_vol : 0.0;
+        double bid_vol = iv::implied_volatility(1.0, K, m.bids()[i], m.T(), true, &st);
+        m.iv_bids()[i] = st.ok ? bid_vol : 0.0;
 
-        double ask_vol = iv::implied_volatility(1.0, K, m.asks[i], m.T(), true, &st);
-        m.iv_asks[i] = st.ok ? ask_vol : 0.0;
+        double ask_vol = iv::implied_volatility(1.0, K, m.asks()[i], m.T(), true, &st);
+        m.iv_asks()[i] = st.ok ? ask_vol : 0.0;
 
-        m.w_prev[i] = (m.iv_bids[i] + m.iv_asks[i]) * 0.5;
-        m.w_prev[i] = m.w_prev[i] * m.w_prev[i] * m.T();
+        m.w_prev()[i] = (m.iv_bids()[i] + m.iv_asks()[i]) * 0.5;
+        m.w_prev()[i] = m.w_prev()[i] * m.w_prev()[i] * m.T();
     }
 }
 
@@ -171,7 +167,7 @@ void Surface::setup_expiry(int j) {
 
     build_model_strikes(
         f.model_strikes, f.market_ix,
-        m.strikes.data(), m.n(),
+        m.strikes(), m.n(),
         cfg_.min_k, cfg_.max_k,
         cfg_.max_dx, cfg_.min_dx);
 
@@ -206,12 +202,12 @@ void Surface::build_kernel(int j) {
     int n_mkt = m.n();
     double variance = cfg_.eta * f.atm_var;
 
-    fill_kernel_matrix(f.C_market, m.strikes.data(), n_mkt,
+    fill_kernel_matrix(f.C_market, m.strikes(), n_mkt,
                        f.model_strikes.data(), N, variance);
 
     // Pre-compute w^2 into persistent buffer (avoids allocation in hot path)
     f.w2.resize(n_mkt);
-    for (int i = 0; i < n_mkt; ++i) f.w2[i] = m.weights[i] * m.weights[i];
+    for (int i = 0; i < n_mkt; ++i) f.w2[i] = m.weights()[i] * m.weights()[i];
 
     compute_hessian(f.H, f.C_market, f.w2.data(),
                     cfg_.smoothness_penalty / N, N);
@@ -242,7 +238,7 @@ void Surface::build_qp(int j) {
 
     // Pre-compute w^2 * mid into persistent buffer (zero allocation)
     f.w2mid.resize(n_mkt);
-    for (int i = 0; i < n_mkt; ++i) f.w2mid[i] = f.w2[i] * m.mids[i];
+    for (int i = 0; i < n_mkt; ++i) f.w2mid[i] = f.w2[i] * m.mids()[i];
 
     f.f.resize(f.N());
     compute_gradient(f.f.data(), f.C_market, f.w2mid.data(), n_mkt, f.N());
@@ -391,23 +387,23 @@ double Surface::tick_update(int expiry_idx, int strike_idx, double new_bid, doub
 
     auto& m = markets_[expiry_idx];
 
-    double intr = std::max(1.0 - m.strikes[strike_idx], 0.0);
-    m.bids[strike_idx] = std::max(new_bid, intr);
-    m.asks[strike_idx] = std::min(new_ask, 1.0);
-    m.spreads[strike_idx] = m.asks[strike_idx] - m.bids[strike_idx];
-    m.mids[strike_idx] = 0.5 * (m.bids[strike_idx] + m.asks[strike_idx]);
+    double intr = std::max(1.0 - m.strikes()[strike_idx], 0.0);
+    m.bids()[strike_idx] = std::max(new_bid, intr);
+    m.asks()[strike_idx] = std::min(new_ask, 1.0);
+    m.spreads()[strike_idx] = m.asks()[strike_idx] - m.bids()[strike_idx];
+    m.mids()[strike_idx] = 0.5 * (m.bids()[strike_idx] + m.asks()[strike_idx]);
 
-    double inv_s = 1.0 / std::max(m.spreads[strike_idx], 1e-12);
-    m.weights[strike_idx] = std::min(inv_s, cfg_.max_inv_spread);
+    double inv_s = 1.0 / std::max(m.spreads()[strike_idx], 1e-12);
+    m.weights()[strike_idx] = std::min(inv_s, cfg_.max_inv_spread);
 
     double wsum = 0.0;
-    for (int i = 0; i < m.n(); ++i) wsum += m.weights[i];
+    for (int i = 0; i < m.n(); ++i) wsum += m.weights()[i];
     if (wsum > 0.0)
-        for (int i = 0; i < m.n(); ++i) m.weights[i] /= wsum;
+        for (int i = 0; i < m.n(); ++i) m.weights()[i] /= wsum;
 
     // Update w^2 for the changed weight (single element, no full recompute)
     auto& f = fits_[expiry_idx];
-    f.w2[strike_idx] = m.weights[strike_idx] * m.weights[strike_idx];
+    f.w2[strike_idx] = m.weights()[strike_idx] * m.weights()[strike_idx];
 
     build_qp(expiry_idx);
     solve_expiry(expiry_idx);
@@ -429,14 +425,14 @@ double Surface::batch_update(const TickUpdate* ticks, int n_ticks) {
         auto& m = markets_[ej];
         if (si < 0 || si >= m.n()) continue;
 
-        double intr = std::max(1.0 - m.strikes[si], 0.0);
-        m.bids[si] = std::max(ticks[t].new_bid, intr);
-        m.asks[si] = std::min(ticks[t].new_ask, 1.0);
-        m.spreads[si] = m.asks[si] - m.bids[si];
-        m.mids[si] = 0.5 * (m.bids[si] + m.asks[si]);
+        double intr = std::max(1.0 - m.strikes()[si], 0.0);
+        m.bids()[si] = std::max(ticks[t].new_bid, intr);
+        m.asks()[si] = std::min(ticks[t].new_ask, 1.0);
+        m.spreads()[si] = m.asks()[si] - m.bids()[si];
+        m.mids()[si] = 0.5 * (m.bids()[si] + m.asks()[si]);
 
-        double inv_s = 1.0 / std::max(m.spreads[si], 1e-12);
-        m.weights[si] = std::min(inv_s, cfg_.max_inv_spread);
+        double inv_s = 1.0 / std::max(m.spreads()[si], 1e-12);
+        m.weights()[si] = std::min(inv_s, cfg_.max_inv_spread);
         dirty[ej] = 1;
     }
 
@@ -446,10 +442,10 @@ double Surface::batch_update(const TickUpdate* ticks, int n_ticks) {
         auto& m = markets_[j];
         auto& f = fits_[j];
         double wsum = 0.0;
-        for (int i = 0; i < m.n(); ++i) wsum += m.weights[i];
+        for (int i = 0; i < m.n(); ++i) wsum += m.weights()[i];
         if (wsum > 0.0)
-            for (int i = 0; i < m.n(); ++i) m.weights[i] /= wsum;
-        for (int i = 0; i < m.n(); ++i) f.w2[i] = m.weights[i] * m.weights[i];
+            for (int i = 0; i < m.n(); ++i) m.weights()[i] /= wsum;
+        for (int i = 0; i < m.n(); ++i) f.w2[i] = m.weights()[i] * m.weights()[i];
     }
 
     // Re-solve only dirty expiries

@@ -120,7 +120,7 @@ static void bench_full_calibration(const SyntheticSPX& data, int n_runs = 50) {
                 auto& m = surf.market(j);
                 double max_err = 0.0;
                 for (int i = 0; i < m.n(); ++i) {
-                    double err = std::abs(f.fitted[i] - m.mids[i]) / m.spreads[i];
+                    double err = std::abs(f.fitted[i] - m.mids()[i]) / m.spreads()[i];
                     max_err = std::max(max_err, err);
                 }
                 printf("  %8s: N=%3d, max_err/spread=%.4f, atm_vol=%.4f\n",
@@ -177,14 +177,14 @@ static void bench_tick_update(const SyntheticSPX& data, int n_ticks = 1000) {
         int strike_idx = rng() % surf.market(exp_idx).n();
 
         auto& m = surf.market(exp_idx);
-        double mid = m.mids[strike_idx];
-        double spread = m.spreads[strike_idx];
+        double mid = m.mids()[strike_idx];
+        double spread = m.spreads()[strike_idx];
 
         // Simulate small price move
         std::normal_distribution<double> move(0.0, spread * 0.1);
         double delta = move(rng);
-        double new_bid = m.bids[strike_idx] + delta;
-        double new_ask = m.asks[strike_idx] + delta;
+        double new_bid = m.bids()[strike_idx] + delta;
+        double new_ask = m.asks()[strike_idx] + delta;
 
         double us = surf.tick_update(exp_idx, strike_idx, new_bid, new_ask);
         times.push_back(us);

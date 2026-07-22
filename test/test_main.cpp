@@ -228,7 +228,7 @@ void test_surface_basic() {
     auto& mkt = surf.market(0);
     int n_outside = 0;
     for (int i = 0; i < ns; ++i) {
-        if (fit.fitted[i] < mkt.bids[i] - 0.01 || fit.fitted[i] > mkt.asks[i] + 0.01) {
+        if (fit.fitted[i] < mkt.bids()[i] - 0.01 || fit.fitted[i] > mkt.asks()[i] + 0.01) {
             n_outside++;
         }
     }

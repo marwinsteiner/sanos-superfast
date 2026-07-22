@@ -7,24 +7,47 @@
 
 namespace sanos {
 
-// Per-expiry market data (pure/normalized strikes and prices).
+// Per-expiry market data in Structure-of-Arrays (SOA) layout.
+// All per-strike arrays are stored in a single contiguous allocation
+// at fixed stride offsets. This means accessing all bids, all asks, etc.
+// reads sequential memory — one cache line services 8 consecutive doubles
+// instead of jumping between 9 separate heap allocations.
 struct ExpiryMarket {
     std::string label;
-    double sqrtT = 0.0;  // sqrt(time to expiry)
+    double sqrtT = 0.0;
 
-    AVec<double> strikes;   // pure strikes (K/F), sorted ascending, must surround 1.0
-    AVec<double> bids;      // pure bid prices
-    AVec<double> asks;      // pure ask prices
-    AVec<double> mids;      // (bid + ask) / 2
-    AVec<double> spreads;   // ask - bid
-    AVec<double> weights;   // 1/spread, capped
-    AVec<double> iv_bids;   // bid implied vols
-    AVec<double> iv_asks;   // ask implied vols
+    // SOA flat block: 9 arrays of n doubles in one contiguous allocation.
+    // Layout: [strikes | bids | asks | mids | spreads | weights | iv_bids | iv_asks | w_prev]
+    static constexpr int N_FIELDS = 9;
+    AVec<double> block_;
+    int n_ = 0;
 
-    // Warm IV state for volfi incremental updates
-    AVec<double> w_prev;    // previous total variance per strike (for warm restart)
+    double* strikes()  { return block_.data(); }
+    double* bids()     { return block_.data() + n_; }
+    double* asks()     { return block_.data() + 2 * n_; }
+    double* mids()     { return block_.data() + 3 * n_; }
+    double* spreads()  { return block_.data() + 4 * n_; }
+    double* weights()  { return block_.data() + 5 * n_; }
+    double* iv_bids()  { return block_.data() + 6 * n_; }
+    double* iv_asks()  { return block_.data() + 7 * n_; }
+    double* w_prev()   { return block_.data() + 8 * n_; }
 
-    int n() const { return static_cast<int>(strikes.size()); }
+    const double* strikes()  const { return block_.data(); }
+    const double* bids()     const { return block_.data() + n_; }
+    const double* asks()     const { return block_.data() + 2 * n_; }
+    const double* mids()     const { return block_.data() + 3 * n_; }
+    const double* spreads()  const { return block_.data() + 4 * n_; }
+    const double* weights()  const { return block_.data() + 5 * n_; }
+    const double* iv_bids()  const { return block_.data() + 6 * n_; }
+    const double* iv_asks()  const { return block_.data() + 7 * n_; }
+    const double* w_prev()   const { return block_.data() + 8 * n_; }
+
+    void alloc(int n) {
+        n_ = n;
+        block_.resize(N_FIELDS * n);
+    }
+
+    int n() const { return n_; }
     double T() const { return sqrtT * sqrtT; }
 };
 
