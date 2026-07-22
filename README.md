@@ -12,10 +12,9 @@ Calibrates a smooth, arbitrage-free implied volatility surface from option bid/a
 
 | Operation | Median | P95 | Min |
 |-----------|--------|-----|-----|
-| Warm recalibration (all expiries) | 340 μs | 397 μs | 306 μs |
-| Cold calibration (new surface) | 1.19 ms | 1.58 ms | 866 μs |
-| Tick update (1 strike changed) | 79 μs | 101 μs | — |
-| Surface query (per point) | 3.8 μs | — | — |
+| Warm recalibration (all expiries) | 367 μs | 427 μs | 313 μs |
+| Cold calibration (new surface) | 1.14 ms | 1.38 ms | 946 μs |
+| Tick update (1 strike changed) | 66 μs | 75 μs | 7 μs |
 
 ## Build
 
