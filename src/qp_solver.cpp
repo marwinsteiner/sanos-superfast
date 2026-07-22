@@ -154,6 +154,12 @@ static void solve_kkt(
         return;
     }
 
+    // Prefetch H rows that will be gathered (cache warming).
+    // The gather loop reads H[free_idx[i] * n ...] which are scattered rows.
+    // Without prefetch, each row miss stalls ~100 cycles waiting for L2/L3.
+    for (int i = 0; i < n_free; ++i)
+        _mm_prefetch(reinterpret_cast<const char*>(H + free_idx[i] * n), _MM_HINT_T0);
+
     // Build reduced system from free indices
     for (int i = 0; i < n_free; ++i) {
         f_r[i] = f[free_idx[i]];

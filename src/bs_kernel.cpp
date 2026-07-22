@@ -201,8 +201,11 @@ void compute_hessian(
 
     for (int j = 0; j < n; ++j) {
         const double* cj = C.col_ptr(j);
+        // Prefetch next column pair to hide L2 latency
+        if (j + 1 < n) _mm_prefetch(reinterpret_cast<const char*>(C.col_ptr(j + 1)), _MM_HINT_T0);
         for (int k = j; k < n; ++k) {
             const double* ck = C.col_ptr(k);
+            if (k + 1 < n) _mm_prefetch(reinterpret_cast<const char*>(C.col_ptr(k + 1)), _MM_HINT_T1);
             __m256d vsum = _mm256_setzero_pd();
             int i = 0;
             for (; i + 4 <= m; i += 4) {
