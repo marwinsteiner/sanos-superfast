@@ -63,13 +63,33 @@ struct ExpiryFit {
     double atm_var  = 0.0;   // ATM variance from market
     double atm_vol  = 0.0;   // ATM vol from market
 
-    // QP solver workspace (reused)
+    // QP solver workspace (reused across solves — zero allocation)
     QPWorkspace qp_ws;
 
+    // Pre-allocated scratch buffers (flyweight pattern — allocated once, reused)
+    AVec<double> w2;       // weights squared, length n_market
+    AVec<double> w2mid;    // w^2 * mid, length n_market
+
     // Caching
-    double cached_atm_var = -1.0;  // ATM var when kernel was last built
-    bool kernel_dirty = true;      // need to recompute kernel matrices
-    bool fit_dirty    = true;      // need to re-solve QP
+    double cached_atm_var = -1.0;
+    bool kernel_dirty = true;
+    bool fit_dirty    = true;
+
+    // Pre-allocate all buffers for a given market size.
+    // Called once during setup; hot path never allocates.
+    void reserve_buffers(int n_market, int n_model) {
+        C_market.reserve(n_market, n_model);
+        H.reserve(n_model, n_model);
+        f.reserve(n_model);
+        A_eq.reserve(2 * n_model);
+        b_eq.reserve(2);
+        q.reserve(n_model);
+        fitted.reserve(n_market);
+        iv_fitted.reserve(n_market);
+        w2.reserve(n_market);
+        w2mid.reserve(n_market);
+        model_strikes.reserve(n_model + 20);
+    }
 };
 
 // Generate model strikes from market strikes, adding fill strikes where gaps > max_dx

@@ -209,7 +209,11 @@ void Surface::build_kernel(int j) {
     fill_kernel_matrix(f.C_market, m.strikes.data(), n_mkt,
                        f.model_strikes.data(), N, variance);
 
-    compute_hessian(f.H, f.C_market, m.weights.data(),
+    // Pre-compute w^2 into persistent buffer (avoids allocation in hot path)
+    f.w2.resize(n_mkt);
+    for (int i = 0; i < n_mkt; ++i) f.w2[i] = m.weights[i] * m.weights[i];
+
+    compute_hessian(f.H, f.C_market, f.w2.data(),
                     cfg_.smoothness_penalty / N, N);
 
     f.A_eq.assign(2 * N, 0.0);
@@ -234,10 +238,14 @@ void Surface::build_kernel(int j) {
 void Surface::build_qp(int j) {
     auto& f = fits_[j];
     auto& m = markets_[j];
+    int n_mkt = m.n();
+
+    // Pre-compute w^2 * mid into persistent buffer (zero allocation)
+    f.w2mid.resize(n_mkt);
+    for (int i = 0; i < n_mkt; ++i) f.w2mid[i] = f.w2[i] * m.mids[i];
 
     f.f.resize(f.N());
-    compute_gradient(f.f.data(), f.C_market, m.weights.data(),
-                     m.mids.data(), m.n(), f.N());
+    compute_gradient(f.f.data(), f.C_market, f.w2mid.data(), n_mkt, f.N());
     f.fit_dirty = true;
 }
 
@@ -397,7 +405,10 @@ double Surface::tick_update(int expiry_idx, int strike_idx, double new_bid, doub
     if (wsum > 0.0)
         for (int i = 0; i < m.n(); ++i) m.weights[i] /= wsum;
 
+    // Update w^2 for the changed weight (single element, no full recompute)
     auto& f = fits_[expiry_idx];
+    f.w2[strike_idx] = m.weights[strike_idx] * m.weights[strike_idx];
+
     build_qp(expiry_idx);
     solve_expiry(expiry_idx);
 

@@ -192,18 +192,13 @@ void mat_t_vec(double* y, const DenseMat& A, const double* x) {
 void compute_hessian(
     DenseMat& H,
     const DenseMat& C,
-    const double* weights,
+    const double* w2,
     double lambda,
     int n)
 {
     int m = C.rows;
     H.resize(n, n);
 
-    // Pre-compute w^2
-    AVec<double> w2(m);
-    for (int i = 0; i < m; ++i) w2[i] = weights[i] * weights[i];
-
-    // H = C^T diag(w^2) C + lambda I
     for (int j = 0; j < n; ++j) {
         const double* cj = C.col_ptr(j);
         for (int k = j; k < n; ++k) {
@@ -213,7 +208,7 @@ void compute_hessian(
             for (; i + 4 <= m; i += 4) {
                 __m256d vcj = _mm256_loadu_pd(cj + i);
                 __m256d vck = _mm256_loadu_pd(ck + i);
-                __m256d vw2 = _mm256_loadu_pd(w2.data() + i);
+                __m256d vw2 = _mm256_loadu_pd(w2 + i);
                 vsum = _mm256_fmadd_pd(_mm256_mul_pd(vcj, vw2), vck, vsum);
             }
             double sum = avx2_hsum(vsum);
@@ -228,25 +223,16 @@ void compute_hessian(
 void compute_gradient(
     double* f,
     const DenseMat& C,
-    const double* weights,
-    const double* mid,
+    const double* w2mid,
     int m, int n)
 {
-    // Pre-compute w^2 * mid
-    AVec<double> w2mid(m);
-    for (int i = 0; i < m; ++i) {
-        double wi = weights[i];
-        w2mid[i] = wi * wi * mid[i];
-    }
-
-    // f = -C^T (w^2 * mid)
     for (int j = 0; j < n; ++j) {
         const double* cj = C.col_ptr(j);
         __m256d vsum = _mm256_setzero_pd();
         int i = 0;
         for (; i + 4 <= m; i += 4) {
             __m256d vc  = _mm256_loadu_pd(cj + i);
-            __m256d vwm = _mm256_loadu_pd(w2mid.data() + i);
+            __m256d vwm = _mm256_loadu_pd(w2mid + i);
             vsum = _mm256_fmadd_pd(vc, vwm, vsum);
         }
         double sum = avx2_hsum(vsum);
@@ -280,7 +266,7 @@ void mat_t_vec(double* y, const DenseMat& A, const double* x) {
 void compute_hessian(
     DenseMat& H,
     const DenseMat& C,
-    const double* weights,
+    const double* w2,
     double lambda,
     int n)
 {
@@ -291,10 +277,7 @@ void compute_hessian(
         for (int k = j; k < n; ++k) {
             const double* ck = C.col_ptr(k);
             double sum = 0.0;
-            for (int i = 0; i < m; ++i) {
-                double wi = weights[i];
-                sum += cj[i] * wi * wi * ck[i];
-            }
+            for (int i = 0; i < m; ++i) sum += cj[i] * w2[i] * ck[i];
             if (j == k) sum += lambda;
             H(j, k) = sum;
             H(k, j) = sum;
@@ -305,17 +288,13 @@ void compute_hessian(
 void compute_gradient(
     double* f,
     const DenseMat& C,
-    const double* weights,
-    const double* mid,
+    const double* w2mid,
     int m, int n)
 {
     for (int j = 0; j < n; ++j) {
         const double* cj = C.col_ptr(j);
         double sum = 0.0;
-        for (int i = 0; i < m; ++i) {
-            double wi = weights[i];
-            sum += cj[i] * wi * wi * mid[i];
-        }
+        for (int i = 0; i < m; ++i) sum += cj[i] * w2mid[i];
         f[j] = -sum;
     }
 }

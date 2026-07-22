@@ -58,10 +58,18 @@ struct DenseMat {
     DenseMat() = default;
     DenseMat(int r, int c) : data(r * c, 0.0), rows(r), cols(c) {}
 
+    // Resize without reallocation if capacity suffices.
+    // Only grows the underlying buffer, never shrinks.
     void resize(int r, int c) {
         rows = r;
         cols = c;
-        data.assign(r * c, 0.0);
+        std::size_t need = static_cast<std::size_t>(r) * c;
+        if (data.size() < need) data.resize(need);
+        std::memset(data.data(), 0, need * sizeof(double));
+    }
+
+    void reserve(int r, int c) {
+        data.reserve(static_cast<std::size_t>(r) * c);
     }
 
     double& operator()(int r, int c) { return data[c * rows + r]; }
